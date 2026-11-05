@@ -4,6 +4,8 @@ import io.nexusdb.core.buffer.BufferPoolManager;
 import io.nexusdb.core.page.Page;
 import io.nexusdb.core.page.RecordId;
 import io.nexusdb.core.page.SlottedPage;
+import io.nexusdb.core.wal.LogManager;
+import io.nexusdb.core.wal.LogRecord;
 
 import java.util.Iterator;
 import java.util.Objects;
@@ -20,17 +22,21 @@ import java.util.Objects;
  * space, returning a new relocated {@link RecordId}. Any secondary indexes referencing the row must
  * be updated when the returned {@link RecordId} differs from the input {@link RecordId}.
  *
- * <p>Concurrency & Pinning Invariants:
+ * <p>Concurrency, Pinning & WAL Invariants:
  * <ul>
  *   <li>At most one buffer pool frame is pinned at any instant during {@link #insert}, {@link #get},
  *       {@link #update}, and {@link #delete}, preventing self-deadlock even on a 1-frame buffer pool.</li>
  *   <li>Every accessed page is protected with {@link Page#rlatch()} or {@link Page#wlatch()} for the
  *       duration of the in-memory page access and unlatched before unpinning.</li>
+ *   <li>Every page mutation appends a WAL record to {@link LogManager} (when attached to
+ *       {@link BufferPoolManager}), stamps {@link Page#setPageLsn(long)}, and updates the buffer pool's
+ *       Dirty Page Table before unpinning.</li>
  * </ul>
  */
 public final class TableHeap implements Iterable<Tuple> {
     private final BufferPoolManager bufferPoolManager;
     private final Schema schema;
+    private final String tableName;
     private final int firstPageId;
     private int lastPageId;
     private long liveRowCount;
@@ -41,6 +47,10 @@ public final class TableHeap implements Iterable<Tuple> {
      * Creates a new {@link TableHeap} by allocating and initializing its first slotted page.
      */
     public static TableHeap create(BufferPoolManager bufferPoolManager, Schema schema) {
+        return create(bufferPoolManager, schema, "");
+    }
+
+    public static TableHeap create(BufferPoolManager bufferPoolManager, Schema schema, String tableName) {
         Objects.requireNonNull(bufferPoolManager, "bufferPoolManager must not be null");
         Objects.requireNonNull(schema, "schema must not be null");
         Page firstPage = bufferPoolManager.newPage();
@@ -50,11 +60,12 @@ public final class TableHeap implements Iterable<Tuple> {
             SlottedPage sp = new SlottedPage(firstPage, true);
             sp.setPrevPageId(-1);
             sp.setNextPageId(-1);
+            bufferPoolManager.logPageWrite(firstPage);
         } finally {
             firstPage.wunlatch();
             bufferPoolManager.unpinPage(firstId, true);
         }
-        return new TableHeap(bufferPoolManager, schema, firstId, firstId, 0L, 1);
+        return new TableHeap(bufferPoolManager, schema, tableName == null ? "" : tableName, firstId, firstId, 0L, 1);
     }
 
     /**
@@ -62,6 +73,14 @@ public final class TableHeap implements Iterable<Tuple> {
      * to discover {@code lastPageId}, {@code pageCount}, and {@code liveRowCount}.
      */
     public static TableHeap open(BufferPoolManager bufferPoolManager, Schema schema, int firstPageId) {
+        return open(bufferPoolManager, schema, firstPageId, "");
+    }
+
+    public static TableHeap open(
+            BufferPoolManager bufferPoolManager,
+            Schema schema,
+            int firstPageId,
+            String tableName) {
         Objects.requireNonNull(bufferPoolManager, "bufferPoolManager must not be null");
         Objects.requireNonNull(schema, "schema must not be null");
         if (firstPageId <= 0) {
@@ -90,7 +109,14 @@ public final class TableHeap implements Iterable<Tuple> {
                 bufferPoolManager.unpinPage(tail, false);
             }
         }
-        return new TableHeap(bufferPoolManager, schema, firstPageId, tail, rows, pages);
+        return new TableHeap(
+                bufferPoolManager,
+                schema,
+                tableName == null ? "" : tableName,
+                firstPageId,
+                tail,
+                rows,
+                pages);
     }
 
     /**
@@ -109,22 +135,28 @@ public final class TableHeap implements Iterable<Tuple> {
         if (firstPageId <= 0 || lastPageId <= 0) {
             throw new IllegalArgumentException("Page IDs must be > 0");
         }
-        return new TableHeap(bufferPoolManager, schema, firstPageId, lastPageId, liveRowCount, pageCount);
+        return new TableHeap(bufferPoolManager, schema, "", firstPageId, lastPageId, liveRowCount, pageCount);
     }
 
     private TableHeap(
             BufferPoolManager bufferPoolManager,
             Schema schema,
+            String tableName,
             int firstPageId,
             int lastPageId,
             long liveRowCount,
             int pageCount) {
         this.bufferPoolManager = bufferPoolManager;
         this.schema = schema;
+        this.tableName = tableName == null ? "" : tableName;
         this.firstPageId = firstPageId;
         this.lastPageId = lastPageId;
         this.liveRowCount = liveRowCount;
         this.pageCount = pageCount;
+    }
+
+    public String getTableName() {
+        return tableName;
     }
 
     public int getFirstPageId() {
@@ -157,6 +189,40 @@ public final class TableHeap implements Iterable<Tuple> {
         return bufferPoolManager;
     }
 
+    /**
+     * Re-scans the heap page chain to refresh {@code lastPageId}, {@code pageCount}, and {@code liveRowCount}.
+     */
+    public void refreshMetadata() {
+        synchronized (heapLock) {
+            int curr = firstPageId;
+            int tail = firstPageId;
+            long rows = 0L;
+            int pages = 0;
+            while (curr != -1) {
+                tail = curr;
+                pages++;
+                Page page = bufferPoolManager.fetchPage(curr);
+                page.rlatch();
+                try {
+                    SlottedPage sp = SlottedPage.wrap(page);
+                    int slotCount = sp.getSlotCount();
+                    for (int slotId = 0; slotId < slotCount; slotId++) {
+                        if (sp.isValidSlot(slotId)) {
+                            rows++;
+                        }
+                    }
+                    curr = sp.getNextPageId();
+                } finally {
+                    page.runlatch();
+                    bufferPoolManager.unpinPage(tail, false);
+                }
+            }
+            this.lastPageId = tail;
+            this.liveRowCount = rows;
+            this.pageCount = pages;
+        }
+    }
+
     private void validateTupleFitsPage(byte[] bytes) {
         int maxPayload = bufferPoolManager.getDiskManager().getPageSize()
                 - SlottedPage.HEADER_SIZE
@@ -165,6 +231,54 @@ public final class TableHeap implements Iterable<Tuple> {
             throw new IllegalArgumentException(
                     "Serialized tuple length " + bytes.length + " exceeds maximum page payload " + maxPayload);
         }
+    }
+
+    private void logTupleInsert(Page page, int slotId, byte[] afterBytes) {
+        LogManager lm = bufferPoolManager.getLogManager();
+        if (lm == null) {
+            return;
+        }
+        LogManager.TransactionLogContext ctx = lm.getThreadTransactionContext();
+        long txnId = ctx != null ? ctx.getTxnId() : 0L;
+        long prevLsn = ctx != null ? ctx.getLastLsn() : 0L;
+        LogRecord rec = lm.appendRecord(
+                LogRecord.insert(0L, txnId, prevLsn, tableName, page.getPageId(), slotId, afterBytes));
+        if (ctx != null) {
+            ctx.onRecordLogged(rec);
+        }
+        bufferPoolManager.recordPageModification(page, rec.lsn());
+    }
+
+    private void logTupleDelete(Page page, int slotId, byte[] beforeBytes) {
+        LogManager lm = bufferPoolManager.getLogManager();
+        if (lm == null) {
+            return;
+        }
+        LogManager.TransactionLogContext ctx = lm.getThreadTransactionContext();
+        long txnId = ctx != null ? ctx.getTxnId() : 0L;
+        long prevLsn = ctx != null ? ctx.getLastLsn() : 0L;
+        LogRecord rec = lm.appendRecord(
+                LogRecord.delete(0L, txnId, prevLsn, tableName, page.getPageId(), slotId, beforeBytes));
+        if (ctx != null) {
+            ctx.onRecordLogged(rec);
+        }
+        bufferPoolManager.recordPageModification(page, rec.lsn());
+    }
+
+    private void logTupleUpdate(Page page, int slotId, byte[] beforeBytes, byte[] afterBytes) {
+        LogManager lm = bufferPoolManager.getLogManager();
+        if (lm == null) {
+            return;
+        }
+        LogManager.TransactionLogContext ctx = lm.getThreadTransactionContext();
+        long txnId = ctx != null ? ctx.getTxnId() : 0L;
+        long prevLsn = ctx != null ? ctx.getLastLsn() : 0L;
+        LogRecord rec = lm.appendRecord(
+                LogRecord.update(0L, txnId, prevLsn, tableName, page.getPageId(), slotId, beforeBytes, afterBytes));
+        if (ctx != null) {
+            ctx.onRecordLogged(rec);
+        }
+        bufferPoolManager.recordPageModification(page, rec.lsn());
     }
 
     /**
@@ -184,6 +298,7 @@ public final class TableHeap implements Iterable<Tuple> {
                 SlottedPage sp = SlottedPage.wrap(tailPage);
                 int slotId = sp.insert(bytes);
                 if (slotId >= 0) {
+                    logTupleInsert(tailPage, slotId, bytes);
                     RecordId rid = new RecordId(lastPageId, slotId);
                     liveRowCount++;
                     tailPage.wunlatch();
@@ -208,10 +323,13 @@ public final class TableHeap implements Iterable<Tuple> {
                 SlottedPage newSp = new SlottedPage(newRawPage, true);
                 newSp.setPrevPageId(oldLastPageId);
                 newSp.setNextPageId(-1);
+                // Log structural page header setup before tuple insert
+                bufferPoolManager.logPageWrite(newRawPage);
                 assignedSlot = newSp.insert(bytes);
                 if (assignedSlot < 0) {
                     throw new IllegalStateException("Newly initialized page failed to insert tuple of length " + bytes.length);
                 }
+                logTupleInsert(newRawPage, assignedSlot, bytes);
             } finally {
                 newRawPage.wunlatch();
                 bufferPoolManager.unpinPage(newPageId, true);
@@ -223,6 +341,7 @@ public final class TableHeap implements Iterable<Tuple> {
             try {
                 SlottedPage prevSp = SlottedPage.wrap(prevPage);
                 prevSp.setNextPageId(newPageId);
+                bufferPoolManager.logPageWrite(prevPage);
             } finally {
                 prevPage.wunlatch();
                 bufferPoolManager.unpinPage(oldLastPageId, true);
@@ -277,10 +396,14 @@ public final class TableHeap implements Iterable<Tuple> {
                 if (!sp.isValidSlot(recordId.slotId())) {
                     throw new IllegalArgumentException("Cannot update non-existent or deleted slot: " + recordId);
                 }
+                byte[] oldBytes = sp.get(recordId.slotId());
                 updatedInPage = sp.update(recordId.slotId(), newBytes);
-                if (!updatedInPage) {
+                if (updatedInPage) {
+                    logTupleUpdate(page, recordId.slotId(), oldBytes, newBytes);
+                } else {
                     // Delete from current page before relocating
                     sp.delete(recordId.slotId());
+                    logTupleDelete(page, recordId.slotId(), oldBytes);
                 }
             } catch (RuntimeException e) {
                 page.wunlatch();
@@ -313,7 +436,11 @@ public final class TableHeap implements Iterable<Tuple> {
             try {
                 SlottedPage sp = SlottedPage.wrap(page);
                 if (sp.isValidSlot(recordId.slotId())) {
+                    byte[] oldBytes = sp.get(recordId.slotId());
                     deleted = sp.delete(recordId.slotId());
+                    if (deleted) {
+                        logTupleDelete(page, recordId.slotId(), oldBytes);
+                    }
                 }
             } finally {
                 page.wunlatch();
@@ -323,6 +450,66 @@ public final class TableHeap implements Iterable<Tuple> {
                 liveRowCount--;
             }
             return deleted;
+        }
+    }
+
+    /**
+     * Restores or overwrites {@code recordId} with {@code rawTupleBytes} during transaction Undo
+     * or WAL Redo, stamping {@code clrOrRedoLsn} on the page.
+     */
+    public void restoreSlotForUndoOrRedo(RecordId recordId, byte[] rawTupleBytes, long clrOrRedoLsn) {
+        Objects.requireNonNull(recordId, "recordId must not be null");
+        Objects.requireNonNull(rawTupleBytes, "rawTupleBytes must not be null");
+        synchronized (heapLock) {
+            int pageId = recordId.pageId();
+            Page page = bufferPoolManager.fetchPage(pageId);
+            page.wlatch();
+            boolean wasValid;
+            try {
+                SlottedPage sp = SlottedPage.wrap(page);
+                wasValid = sp.isValidSlot(recordId.slotId());
+                if (!sp.putSlot(recordId.slotId(), rawTupleBytes)) {
+                    throw new IllegalStateException("Failed to restore slot " + recordId + " during undo/redo");
+                }
+                if (clrOrRedoLsn > 0L) {
+                    bufferPoolManager.recordPageModification(page, clrOrRedoLsn);
+                }
+            } finally {
+                page.wunlatch();
+                bufferPoolManager.unpinPage(pageId, true);
+            }
+            if (!wasValid) {
+                liveRowCount++;
+            }
+        }
+    }
+
+    /**
+     * Deletes {@code recordId} during transaction Undo or WAL Redo, stamping {@code clrOrRedoLsn} on the page.
+     */
+    public void deleteSlotForUndoOrRedo(RecordId recordId, long clrOrRedoLsn) {
+        Objects.requireNonNull(recordId, "recordId must not be null");
+        synchronized (heapLock) {
+            int pageId = recordId.pageId();
+            Page page = bufferPoolManager.fetchPage(pageId);
+            page.wlatch();
+            boolean wasValid;
+            try {
+                SlottedPage sp = SlottedPage.wrap(page);
+                wasValid = sp.isValidSlot(recordId.slotId());
+                if (wasValid) {
+                    sp.delete(recordId.slotId());
+                }
+                if (clrOrRedoLsn > 0L) {
+                    bufferPoolManager.recordPageModification(page, clrOrRedoLsn);
+                }
+            } finally {
+                page.wunlatch();
+                bufferPoolManager.unpinPage(pageId, true);
+            }
+            if (wasValid) {
+                liveRowCount--;
+            }
         }
     }
 

@@ -13,11 +13,14 @@ import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
 import io.nexusdb.core.storage.DiskManager;
+import io.nexusdb.core.wal.CheckpointManager;
+import io.nexusdb.core.wal.LogManager;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -37,16 +40,25 @@ public final class Database implements AutoCloseable {
     );
 
     private final DiskManager diskManager;
+    private final LogManager logManager;
     private final BufferPoolManager bufferPoolManager;
+    private final CheckpointManager checkpointManager;
     private final Catalog catalog;
     private final Binder binder;
     private final ExecutionPlanner executionPlanner;
     private final Object executionLock = new Object();
     private volatile boolean closed;
 
-    private Database(DiskManager diskManager, BufferPoolManager bufferPoolManager, Catalog catalog) {
+    private Database(
+            DiskManager diskManager,
+            LogManager logManager,
+            BufferPoolManager bufferPoolManager,
+            CheckpointManager checkpointManager,
+            Catalog catalog) {
         this.diskManager = diskManager;
+        this.logManager = logManager;
         this.bufferPoolManager = bufferPoolManager;
+        this.checkpointManager = checkpointManager;
         this.catalog = catalog;
         this.binder = new Binder(catalog);
         this.executionPlanner = new ExecutionPlanner();
@@ -63,15 +75,30 @@ public final class Database implements AutoCloseable {
     public static Database open(Path path, int bufferPoolSize) {
         Objects.requireNonNull(path, "path must not be null");
         Path dbFile = resolveDatabaseFile(path);
+        Path walFile = resolveWalFile(dbFile);
         DiskManager dm = DiskManager.open(dbFile);
+        LogManager lm = null;
         try {
+            lm = LogManager.open(walFile);
             BufferPoolManager bpm = new BufferPoolManager(bufferPoolSize, dm);
+            bpm.setLogManager(lm);
+            CheckpointManager ckpt = new CheckpointManager(lm, bpm, dm);
             Catalog catalog = Catalog.open(bpm);
-            return new Database(dm, bpm, catalog);
+            return new Database(dm, lm, bpm, ckpt, catalog);
         } catch (RuntimeException e) {
+            if (lm != null) {
+                try {
+                    lm.close();
+                } catch (RuntimeException ignored) {
+                }
+            }
             dm.close();
             throw e;
         }
+    }
+
+    public static Path resolveWalFile(Path dbFile) {
+        return dbFile.resolveSibling(dbFile.getFileName().toString() + ".wal");
     }
 
     private static Path resolveDatabaseFile(Path path) {
@@ -231,6 +258,28 @@ public final class Database implements AutoCloseable {
         return diskManager;
     }
 
+    public LogManager getLogManager() {
+        return logManager;
+    }
+
+    public CheckpointManager getCheckpointManager() {
+        return checkpointManager;
+    }
+
+    public CheckpointManager.CheckpointResult checkpoint() {
+        synchronized (executionLock) {
+            ensureOpen();
+            return checkpointManager.checkpoint();
+        }
+    }
+
+    public CheckpointManager.CheckpointResult checkpoint(Map<Long, Long> activeTransactions) {
+        synchronized (executionLock) {
+            ensureOpen();
+            return checkpointManager.checkpoint(activeTransactions);
+        }
+    }
+
     private void ensureOpen() {
         if (closed) {
             throw new IllegalStateException("Database is closed");
@@ -245,7 +294,11 @@ public final class Database implements AutoCloseable {
                 try {
                     bufferPoolManager.close();
                 } finally {
-                    diskManager.close();
+                    try {
+                        logManager.close();
+                    } finally {
+                        diskManager.close();
+                    }
                 }
             }
         }

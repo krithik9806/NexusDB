@@ -138,6 +138,7 @@ public final class BPlusTree {
         rootPage.wlatch();
         try {
             BPlusTreePage.initLeaf(rootPage, keyType, unique);
+            bufferPoolManager.logPageWrite(rootPage);
         } finally {
             rootPage.wunlatch();
             bufferPoolManager.unpinPage(pageId, true);
@@ -507,6 +508,7 @@ public final class BPlusTree {
                     return false;
                 }
                 leaf.removeAt(bs);
+                bufferPoolManager.logPageWrite(leafPage);
                 leafUnderflow = (leafPageId != rootPageId) && isNodeUnderflow(leaf);
             } catch (RuntimeException e) {
                 leafPage.wunlatch();
@@ -753,6 +755,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage left = BPlusTreePage.wrap(leftMut);
             left.removeAt(left.getKeyCount() - 1);
+            bufferPoolManager.logPageWrite(leftMut);
         } finally {
             leftMut.wunlatch();
             bufferPoolManager.unpinPage(leftPageId, true);
@@ -763,6 +766,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage child = BPlusTreePage.wrap(childMut);
             child.insertLeafAt(0, candidate.key(), candidate.recordId());
+            bufferPoolManager.logPageWrite(childMut);
         } finally {
             childMut.wunlatch();
             bufferPoolManager.unpinPage(childPageId, true);
@@ -773,6 +777,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
             parent.setInternalKeyAt(sepIdx, candidate.key(), candidate.recordId());
+            bufferPoolManager.logPageWrite(parentMut);
         } finally {
             parentMut.wunlatch();
             bufferPoolManager.unpinPage(parentPageId, true);
@@ -832,6 +837,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage right = BPlusTreePage.wrap(rightMut);
             right.removeAt(0);
+            bufferPoolManager.logPageWrite(rightMut);
         } finally {
             rightMut.wunlatch();
             bufferPoolManager.unpinPage(rightPageId, true);
@@ -842,6 +848,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage child = BPlusTreePage.wrap(childMut);
             child.insertLeafAt(child.getKeyCount(), candidate.key(), candidate.recordId());
+            bufferPoolManager.logPageWrite(childMut);
         } finally {
             childMut.wunlatch();
             bufferPoolManager.unpinPage(childPageId, true);
@@ -852,6 +859,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
             parent.setInternalKeyAt(sepIdx, newRightMin.key(), newRightMin.recordId());
+            bufferPoolManager.logPageWrite(parentMut);
         } finally {
             parentMut.wunlatch();
             bufferPoolManager.unpinPage(parentPageId, true);
@@ -882,6 +890,7 @@ public final class BPlusTree {
                 left.insertLeafAt(left.getKeyCount(), entry.key(), entry.recordId());
             }
             left.setNextLeafPageId(rightNextLeaf);
+            bufferPoolManager.logPageWrite(leftPage);
         } finally {
             leftPage.wunlatch();
             bufferPoolManager.unpinPage(leftPageId, true);
@@ -892,6 +901,7 @@ public final class BPlusTree {
             nextLeafPage.wlatch();
             try {
                 BPlusTreePage.wrap(nextLeafPage).setPrevLeafPageId(leftPageId);
+                bufferPoolManager.logPageWrite(nextLeafPage);
             } finally {
                 nextLeafPage.wunlatch();
                 bufferPoolManager.unpinPage(rightNextLeaf, true);
@@ -954,6 +964,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage left = BPlusTreePage.wrap(leftMut);
             left.removeAt(left.getKeyCount() - 1);
+            bufferPoolManager.logPageWrite(leftMut);
         } finally {
             leftMut.wunlatch();
             bufferPoolManager.unpinPage(leftPageId, true);
@@ -966,6 +977,7 @@ public final class BPlusTree {
             int oldFirstChild = child.getFirstChildPageId();
             child.setFirstChildPageId(lastLeft.rightChildPageId());
             child.insertInternalAt(0, parentSep.key(), parentSep.recordId(), oldFirstChild);
+            bufferPoolManager.logPageWrite(childMut);
         } finally {
             childMut.wunlatch();
             bufferPoolManager.unpinPage(childPageId, true);
@@ -976,6 +988,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
             parent.setInternalKeyAt(sepIdx, lastLeft.key(), lastLeft.recordId());
+            bufferPoolManager.logPageWrite(parentMut);
         } finally {
             parentMut.wunlatch();
             bufferPoolManager.unpinPage(parentPageId, true);
@@ -1038,6 +1051,7 @@ public final class BPlusTree {
             BPlusTreePage right = BPlusTreePage.wrap(rightMut);
             right.removeAt(0);
             right.setFirstChildPageId(firstRight.rightChildPageId());
+            bufferPoolManager.logPageWrite(rightMut);
         } finally {
             rightMut.wunlatch();
             bufferPoolManager.unpinPage(rightPageId, true);
@@ -1048,6 +1062,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage child = BPlusTreePage.wrap(childMut);
             child.insertInternalAt(child.getKeyCount(), parentSep.key(), parentSep.recordId(), rightFirstChild);
+            bufferPoolManager.logPageWrite(childMut);
         } finally {
             childMut.wunlatch();
             bufferPoolManager.unpinPage(childPageId, true);
@@ -1058,6 +1073,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
             parent.setInternalKeyAt(sepIdx, firstRight.key(), firstRight.recordId());
+            bufferPoolManager.logPageWrite(parentMut);
         } finally {
             parentMut.wunlatch();
             bufferPoolManager.unpinPage(parentPageId, true);
@@ -1098,6 +1114,7 @@ public final class BPlusTree {
             for (BPlusTreePage.InternalEntry entry : rightEntries) {
                 left.insertInternalAt(left.getKeyCount(), entry.key(), entry.recordId(), entry.rightChildPageId());
             }
+            bufferPoolManager.logPageWrite(leftPage);
         } finally {
             leftPage.wunlatch();
             bufferPoolManager.unpinPage(leftPageId, true);
@@ -1116,6 +1133,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage parent = BPlusTreePage.wrap(parentPage);
             parent.removeAt(sepIdx);
+            bufferPoolManager.logPageWrite(parentPage);
             if (parentPageId == rootPageId) {
                 collapseRoot = (parent.getKeyCount() == 0);
             } else {
@@ -1143,6 +1161,7 @@ public final class BPlusTree {
                 BPlusTreePage rootNode = BPlusTreePage.wrap(rootPage);
                 BPlusTreePage snapshotNode = BPlusTreePage.wrap(new Page(mergedChildPageId, childSnapshot));
                 rootNode.copyNodeContentsFrom(snapshotNode);
+                bufferPoolManager.logPageWrite(rootPage);
             } finally {
                 rootPage.wunlatch();
                 bufferPoolManager.unpinPage(rootPageId, true);
@@ -1182,6 +1201,7 @@ public final class BPlusTree {
             int insertIdx = -bs - 1;
             if (leaf.getKeyCount() < maxKeys && leaf.canFitLeafEntry(key)) {
                 leaf.insertLeafAt(insertIdx, key, recordId);
+                bufferPoolManager.logPageWrite(leafPage);
                 leafPage.wunlatch();
                 bufferPoolManager.unpinPage(leafPageId, true);
                 return null;
@@ -1213,6 +1233,7 @@ public final class BPlusTree {
                 leftLeaf.setAllLeafEntries(leftEntries);
                 leftLeaf.setPrevLeafPageId(-1);
                 leftLeaf.setNextLeafPageId(-1);
+                bufferPoolManager.logPageWrite(leftChildRaw);
             } finally {
                 leftChildRaw.wunlatch();
                 bufferPoolManager.unpinPage(leftChildPageId, true);
@@ -1226,6 +1247,7 @@ public final class BPlusTree {
                 rightLeaf.setAllLeafEntries(rightEntries);
                 rightLeaf.setPrevLeafPageId(leftChildPageId);
                 rightLeaf.setNextLeafPageId(-1);
+                bufferPoolManager.logPageWrite(rightChildRaw);
             } finally {
                 rightChildRaw.wunlatch();
                 bufferPoolManager.unpinPage(rightChildPageId, true);
@@ -1235,6 +1257,7 @@ public final class BPlusTree {
             leftUpdate.wlatch();
             try {
                 BPlusTreePage.wrap(leftUpdate).setNextLeafPageId(rightChildPageId);
+                bufferPoolManager.logPageWrite(leftUpdate);
             } finally {
                 leftUpdate.wunlatch();
                 bufferPoolManager.unpinPage(leftChildPageId, true);
@@ -1245,6 +1268,7 @@ public final class BPlusTree {
             try {
                 BPlusTreePage rootInternal = BPlusTreePage.initInternal(rootRaw, keyType, unique, leftChildPageId);
                 rootInternal.insertInternalAt(0, promoted.key(), promoted.recordId(), rightChildPageId);
+                bufferPoolManager.logPageWrite(rootRaw);
             } finally {
                 rootRaw.wunlatch();
                 bufferPoolManager.unpinPage(rootPageId, true);
@@ -1260,6 +1284,7 @@ public final class BPlusTree {
             rightLeaf.setAllLeafEntries(rightEntries);
             rightLeaf.setPrevLeafPageId(leafPageId);
             rightLeaf.setNextLeafPageId(oldNextLeaf);
+            bufferPoolManager.logPageWrite(rightRaw);
         } finally {
             rightRaw.wunlatch();
             bufferPoolManager.unpinPage(rightLeafPageId, true);
@@ -1272,6 +1297,7 @@ public final class BPlusTree {
             leftLeaf.setAllLeafEntries(leftEntries);
             leftLeaf.setPrevLeafPageId(oldPrevLeaf);
             leftLeaf.setNextLeafPageId(rightLeafPageId);
+            bufferPoolManager.logPageWrite(leftUpdate);
         } finally {
             leftUpdate.wunlatch();
             bufferPoolManager.unpinPage(leafPageId, true);
@@ -1282,6 +1308,7 @@ public final class BPlusTree {
             nextLeafRaw.wlatch();
             try {
                 BPlusTreePage.wrap(nextLeafRaw).setPrevLeafPageId(rightLeafPageId);
+                bufferPoolManager.logPageWrite(nextLeafRaw);
             } finally {
                 nextLeafRaw.wunlatch();
                 bufferPoolManager.unpinPage(oldNextLeaf, true);
@@ -1308,6 +1335,7 @@ public final class BPlusTree {
 
             if (internal.getKeyCount() < maxKeys && internal.canFitInternalEntry(key)) {
                 internal.insertInternalAt(insertIdx, key, recordId, rightChildPageId);
+                bufferPoolManager.logPageWrite(internalPage);
                 internalPage.wunlatch();
                 bufferPoolManager.unpinPage(internalPageId, true);
                 return null;
@@ -1337,6 +1365,7 @@ public final class BPlusTree {
             try {
                 BPlusTreePage leftNode = BPlusTreePage.initInternal(leftRaw, keyType, unique, firstChildPageId);
                 leftNode.setAllInternalEntries(firstChildPageId, leftEntries);
+                bufferPoolManager.logPageWrite(leftRaw);
             } finally {
                 leftRaw.wunlatch();
                 bufferPoolManager.unpinPage(leftInternalPageId, true);
@@ -1348,6 +1377,7 @@ public final class BPlusTree {
             try {
                 BPlusTreePage rightNode = BPlusTreePage.initInternal(rightRaw, keyType, unique, rightFirstChildPageId);
                 rightNode.setAllInternalEntries(rightFirstChildPageId, rightEntries);
+                bufferPoolManager.logPageWrite(rightRaw);
             } finally {
                 rightRaw.wunlatch();
                 bufferPoolManager.unpinPage(rightInternalPageId, true);
@@ -1358,6 +1388,7 @@ public final class BPlusTree {
             try {
                 BPlusTreePage rootNode = BPlusTreePage.initInternal(rootRaw, keyType, unique, leftInternalPageId);
                 rootNode.insertInternalAt(0, pushedUp.key(), pushedUp.recordId(), rightInternalPageId);
+                bufferPoolManager.logPageWrite(rootRaw);
             } finally {
                 rootRaw.wunlatch();
                 bufferPoolManager.unpinPage(rootPageId, true);
@@ -1370,6 +1401,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage leftNode = BPlusTreePage.wrap(leftUpdate);
             leftNode.setAllInternalEntries(firstChildPageId, leftEntries);
+            bufferPoolManager.logPageWrite(leftUpdate);
         } finally {
             leftUpdate.wunlatch();
             bufferPoolManager.unpinPage(internalPageId, true);
@@ -1381,6 +1413,7 @@ public final class BPlusTree {
         try {
             BPlusTreePage rightNode = BPlusTreePage.initInternal(rightRaw, keyType, unique, rightFirstChildPageId);
             rightNode.setAllInternalEntries(rightFirstChildPageId, rightEntries);
+            bufferPoolManager.logPageWrite(rightRaw);
         } finally {
             rightRaw.wunlatch();
             bufferPoolManager.unpinPage(rightInternalPageId, true);
@@ -1399,6 +1432,33 @@ public final class BPlusTree {
             collectPagesPostOrder(rootPageId, allPages);
             for (int pageId : allPages) {
                 bufferPoolManager.deletePage(pageId);
+            }
+        } finally {
+            treeLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Frees any non-root child pages and re-initializes {@code rootPageId} as an empty leaf node.
+     */
+    public void clear() {
+        treeLock.writeLock().lock();
+        try {
+            List<Integer> allPages = new ArrayList<>();
+            collectPagesPostOrder(rootPageId, allPages);
+            for (int pageId : allPages) {
+                if (pageId != rootPageId) {
+                    bufferPoolManager.deletePage(pageId);
+                }
+            }
+            Page rootPage = bufferPoolManager.fetchPage(rootPageId);
+            rootPage.wlatch();
+            try {
+                BPlusTreePage.initLeaf(rootPage, keyType, unique);
+                bufferPoolManager.logPageWrite(rootPage);
+            } finally {
+                rootPage.wunlatch();
+                bufferPoolManager.unpinPage(rootPageId, true);
             }
         } finally {
             treeLock.writeLock().unlock();

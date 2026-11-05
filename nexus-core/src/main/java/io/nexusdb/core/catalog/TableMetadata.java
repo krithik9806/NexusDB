@@ -5,6 +5,8 @@ import io.nexusdb.core.page.RecordId;
 import io.nexusdb.core.record.Column;
 import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
+import io.nexusdb.core.record.TableIterator;
+import io.nexusdb.core.record.Tuple;
 
 import java.util.List;
 import java.util.Locale;
@@ -126,6 +128,24 @@ public final class TableMetadata {
 
     void removeIndexTree(String indexName) {
         indexTrees.remove(indexName.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * Synchronizes all registered B+Tree indexes with the current contents of {@link #getTableHeap()}.
+     */
+    public void rebuildIndexesFromHeap() {
+        tableHeap.refreshMetadata();
+        for (IndexMetadata idx : indexes) {
+            int colIdx = schema.getColumnIndex(idx.columnName());
+            BPlusTree tree = getIndexTree(idx);
+            tree.clear();
+            try (TableIterator it = tableHeap.scan()) {
+                while (it.hasNext()) {
+                    Tuple row = it.next();
+                    tree.insert(row.getValue(colIdx), row.getRecordId());
+                }
+            }
+        }
     }
 
     TableMetadata withCatalogRecordId(RecordId newRecordId) {

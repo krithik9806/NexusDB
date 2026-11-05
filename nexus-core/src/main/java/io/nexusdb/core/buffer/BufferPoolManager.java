@@ -3,10 +3,13 @@ package io.nexusdb.core.buffer;
 import io.nexusdb.core.page.Page;
 import io.nexusdb.core.storage.DiskManager;
 import io.nexusdb.core.storage.PageAllocator;
+import io.nexusdb.core.wal.LogManager;
 
 import java.util.ArrayDeque;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
@@ -35,12 +38,14 @@ public final class BufferPoolManager implements AutoCloseable {
     private final Frame[] frames;
     private final Deque<Integer> freeFrames;
     private final Map<Integer, Integer> pageTable;
+    private final Map<Integer, Long> dirtyPageTable;
     private final Object poolLock = new Object();
 
     private final AtomicLong hits = new AtomicLong();
     private final AtomicLong misses = new AtomicLong();
     private final AtomicLong evictions = new AtomicLong();
     private volatile LongConsumer walFlushHook;
+    private volatile LogManager logManager;
 
     private static final class Frame {
         Page page;
@@ -55,10 +60,18 @@ public final class BufferPoolManager implements AutoCloseable {
     }
 
     public BufferPoolManager(int poolSize, DiskManager diskManager) {
-        this(poolSize, diskManager, new PageAllocator(diskManager));
+        this(poolSize, diskManager, new PageAllocator(diskManager), null);
     }
 
     public BufferPoolManager(int poolSize, DiskManager diskManager, PageAllocator pageAllocator) {
+        this(poolSize, diskManager, pageAllocator, null);
+    }
+
+    public BufferPoolManager(
+            int poolSize,
+            DiskManager diskManager,
+            PageAllocator pageAllocator,
+            LogManager logManager) {
         if (poolSize <= 0) {
             throw new IllegalArgumentException("poolSize must be > 0, got: " + poolSize);
         }
@@ -69,11 +82,28 @@ public final class BufferPoolManager implements AutoCloseable {
         this.frames = new Frame[poolSize];
         this.freeFrames = new ArrayDeque<>(poolSize);
         this.pageTable = new HashMap<>(poolSize * 2);
+        this.dirtyPageTable = new LinkedHashMap<>(poolSize * 2);
 
         for (int i = 0; i < poolSize; i++) {
             frames[i] = new Frame();
             freeFrames.addLast(i);
         }
+        if (logManager != null) {
+            setLogManager(logManager);
+        }
+    }
+
+    /**
+     * Attaches a {@link LogManager} to this buffer pool and registers its {@code flushUpTo}
+     * callback as the Write-Ahead Logging flush hook.
+     */
+    public void setLogManager(LogManager logManager) {
+        this.logManager = logManager;
+        this.walFlushHook = logManager != null ? logManager::flushUpTo : null;
+    }
+
+    public LogManager getLogManager() {
+        return logManager;
     }
 
     /**
@@ -82,6 +112,50 @@ public final class BufferPoolManager implements AutoCloseable {
      */
     public void setWalFlushHook(LongConsumer walFlushHook) {
         this.walFlushHook = walFlushHook;
+    }
+
+    /**
+     * Stamps {@code page.setPageLsn(lsn)} and records {@code lsn} in the Dirty Page Table
+     * as {@code recLsn} if the page was not already dirty since its last flush.
+     */
+    public void recordPageModification(Page page, long lsn) {
+        Objects.requireNonNull(page, "page must not be null");
+        page.setPageLsn(lsn);
+        if (lsn > 0) {
+            synchronized (poolLock) {
+                int pageId = page.getPageId();
+                Integer frameId = pageTable.get(pageId);
+                if (frameId != null) {
+                    frames[frameId].dirty = true;
+                }
+                dirtyPageTable.putIfAbsent(pageId, lsn);
+            }
+        }
+    }
+
+    /**
+     * Logs a physical page-write WAL record for {@code page} (if a {@link LogManager} is attached),
+     * stamps {@code page.setPageLsn(lsn)}, and updates the Dirty Page Table.
+     */
+    public long logPageWrite(Page page) {
+        Objects.requireNonNull(page, "page must not be null");
+        LogManager lm = this.logManager;
+        if (lm == null) {
+            return page.getPageLsn();
+        }
+        long lsn = lm.appendPageWrite(0L, 0L, page.getPageId(), null, page.getData());
+        recordPageModification(page, lsn);
+        return lsn;
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of the Dirty Page Table ({@code pageId -> recLsn}),
+     * where {@code recLsn} is the first WAL LSN that dirtied each page since it was last flushed.
+     */
+    public Map<Integer, Long> getDirtyPageTable() {
+        synchronized (poolLock) {
+            return Collections.unmodifiableMap(new LinkedHashMap<>(dirtyPageTable));
+        }
     }
 
     /**
@@ -157,6 +231,14 @@ public final class BufferPoolManager implements AutoCloseable {
             }
             if (isDirty) {
                 frame.dirty = true;
+                long pageLsn = frame.page.getPageLsn();
+                if (pageLsn == 0L && logManager != null) {
+                    pageLsn = logManager.appendPageWrite(0L, 0L, pageId, null, frame.page.getData());
+                    frame.page.setPageLsn(pageLsn);
+                }
+                if (pageLsn > 0L) {
+                    dirtyPageTable.putIfAbsent(pageId, pageLsn);
+                }
             }
             frame.pinCount--;
             if (frame.pinCount == 0) {
@@ -213,8 +295,11 @@ public final class BufferPoolManager implements AutoCloseable {
                 }
                 replacer.pin(frameId);
                 pageTable.remove(pageId);
+                dirtyPageTable.remove(pageId);
                 frame.reset();
                 freeFrames.addLast(frameId);
+            } else {
+                dirtyPageTable.remove(pageId);
             }
             pageAllocator.deallocatePage(pageId);
             return true;
@@ -235,6 +320,7 @@ public final class BufferPoolManager implements AutoCloseable {
             writeBackLocked(victim);
         }
         pageTable.remove(victim.page.getPageId());
+        dirtyPageTable.remove(victim.page.getPageId());
         victim.reset();
         evictions.incrementAndGet();
         return victimFrameId;
@@ -242,15 +328,21 @@ public final class BufferPoolManager implements AutoCloseable {
 
     private void writeBackLocked(Frame frame) {
         Page page = frame.page;
+        long pageLsn = page.getPageLsn();
         LongConsumer hook = this.walFlushHook;
-        if (hook != null) {
-            long pageLsn = page.getPageLsn();
-            if (pageLsn > 0) {
-                hook.accept(pageLsn);
-            }
+        if (hook != null && pageLsn > 0) {
+            hook.accept(pageLsn);
+        }
+        LogManager lm = this.logManager;
+        if (lm != null && pageLsn > 0 && lm.getFlushedLsn() < pageLsn) {
+            throw new IllegalStateException(
+                    "Write-Ahead Logging protocol violation: cannot write dirty page " + page.getPageId()
+                            + " (pageLSN=" + pageLsn + ") before WAL is flushed (flushedLSN="
+                            + lm.getFlushedLsn() + ")");
         }
         diskManager.writePage(page.getPageId(), page.getData());
         frame.dirty = false;
+        dirtyPageTable.remove(page.getPageId());
     }
 
     public int getPoolSize() {

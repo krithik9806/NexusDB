@@ -268,6 +268,55 @@ public final class SlottedPage {
     }
 
     /**
+     * Places {@code data} at the exact {@code slotId}, expanding the slot directory if
+     * {@code slotId >= getSlotCount()} or overwriting/restoring an existing or deleted slot.
+     * Used during WAL Redo and transaction Undo.
+     */
+    public boolean putSlot(int slotId, byte[] data) {
+        if (data == null) {
+            throw new IllegalArgumentException("Slot data must not be null");
+        }
+        if (slotId < 0) {
+            throw new IllegalArgumentException("slotId must be >= 0, got: " + slotId);
+        }
+        int currentCount = getSlotCount();
+        int extraSlotsNeeded = (slotId >= currentCount) ? (slotId - currentCount + 1) : 0;
+        int extraSlotBytes = extraSlotsNeeded * SLOT_SIZE;
+
+        if (slotId < currentCount && getSlotOffsetRaw(slotId) != DELETED_SLOT_OFFSET) {
+            int oldOffset = Short.toUnsignedInt(getSlotOffsetRaw(slotId));
+            int oldLen = getSlotLength(slotId);
+            if (oldOffset == getFreeSpacePointer()) {
+                setFreeSpacePointer(oldOffset + oldLen);
+            } else {
+                setFragmentedBytes(getFragmentedBytes() + oldLen);
+            }
+            setSlotDeleted(slotId);
+        }
+
+        if (data.length + extraSlotBytes > getTotalFreeSpace()) {
+            return false;
+        }
+        if (extraSlotsNeeded > 0) {
+            if (extraSlotBytes > getContiguousFreeSpace()) {
+                compact();
+            }
+            for (int s = currentCount; s <= slotId; s++) {
+                setSlotDeleted(s);
+            }
+            setSlotCount(slotId + 1);
+        }
+        if (data.length > getContiguousFreeSpace()) {
+            compact();
+        }
+        int newFreePtr = getFreeSpacePointer() - data.length;
+        setFreeSpacePointer(newFreePtr);
+        writeBytes(newFreePtr, data);
+        setSlot(slotId, newFreePtr, data.length);
+        return true;
+    }
+
+    /**
      * Compacts all live tuples toward the end of the page, eliminating fragmented space
      * while strictly preserving every tuple's {@code slotId}.
      */

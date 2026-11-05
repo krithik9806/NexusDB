@@ -63,6 +63,7 @@ public final class Catalog {
                 SlottedPage sp = new SlottedPage(rootPage, true);
                 sp.setPrevPageId(-1);
                 sp.setNextPageId(-1);
+                bufferPoolManager.logPageWrite(rootPage);
             } finally {
                 rootPage.wunlatch();
                 bufferPoolManager.unpinPage(newPageId, true);
@@ -154,7 +155,7 @@ public final class Catalog {
                 throw new IllegalArgumentException("Table already exists: " + name);
             }
 
-            TableHeap heap = TableHeap.create(bufferPoolManager, schema);
+            TableHeap heap = TableHeap.create(bufferPoolManager, schema, name);
             TableMetadata provisional = new TableMetadata(
                     name, schema, heap.getFirstPageId(), heap, List.of(), null);
             byte[] encoded = serializeEntry(provisional);
@@ -371,6 +372,7 @@ public final class Catalog {
             if (!updatedInPlace) {
                 sp.delete(oldRid.slotId());
             }
+            bufferPoolManager.logPageWrite(page);
         } finally {
             page.wunlatch();
             bufferPoolManager.unpinPage(pageId, true);
@@ -398,6 +400,7 @@ public final class Catalog {
             SlottedPage sp = SlottedPage.wrap(tailPage);
             int slotId = sp.insert(encoded);
             if (slotId >= 0) {
+                bufferPoolManager.logPageWrite(tailPage);
                 RecordId rid = new RecordId(catalogLastPageId, slotId);
                 tailPage.wunlatch();
                 bufferPoolManager.unpinPage(catalogLastPageId, true);
@@ -421,6 +424,7 @@ public final class Catalog {
             newSp.setPrevPageId(oldLastPageId);
             newSp.setNextPageId(-1);
             assignedSlot = newSp.insert(encoded);
+            bufferPoolManager.logPageWrite(newPage);
         } finally {
             newPage.wunlatch();
             bufferPoolManager.unpinPage(newPageId, true);
@@ -431,6 +435,7 @@ public final class Catalog {
         try {
             SlottedPage prevSp = SlottedPage.wrap(prevPage);
             prevSp.setNextPageId(newPageId);
+            bufferPoolManager.logPageWrite(prevPage);
         } finally {
             prevPage.wunlatch();
             bufferPoolManager.unpinPage(oldLastPageId, true);
@@ -447,6 +452,7 @@ public final class Catalog {
         try {
             SlottedPage sp = SlottedPage.wrap(page);
             sp.delete(rid.slotId());
+            bufferPoolManager.logPageWrite(page);
         } finally {
             page.wunlatch();
             bufferPoolManager.unpinPage(pageId, true);
@@ -535,7 +541,7 @@ public final class Catalog {
                 indexes.add(new IndexMetadata(indexName, tableName, columnName, rootPageId, unique));
             }
 
-            TableHeap heap = TableHeap.open(bufferPoolManager, schema, firstHeapPageId);
+            TableHeap heap = TableHeap.open(bufferPoolManager, schema, firstHeapPageId, tableName);
             return new TableMetadata(tableName, schema, firstHeapPageId, heap, indexes, catalogRid);
         } catch (IOException e) {
             throw new IllegalStateException("Corrupted catalog entry at " + catalogRid, e);

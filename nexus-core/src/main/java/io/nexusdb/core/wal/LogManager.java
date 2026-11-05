@@ -48,6 +48,19 @@ public final class LogManager implements AutoCloseable {
     private final Object bufferLock = new Object();
     private final Object flushLock = new Object();
     private final AtomicInteger forceCount = new AtomicInteger();
+    private final ThreadLocal<TransactionLogContext> threadTxnContext = new ThreadLocal<>();
+
+    /**
+     * Callback context bound to the current thread when executing inside an active transaction,
+     * allowing storage structures ({@code TableHeap}) to chain {@code prevLsn} automatically.
+     */
+    public interface TransactionLogContext {
+        long getTxnId();
+
+        long getLastLsn();
+
+        void onRecordLogged(LogRecord record);
+    }
 
     public LogManager(Path walPath) {
         this(walPath, DEFAULT_LOG_BUFFER_SIZE);
@@ -276,6 +289,22 @@ public final class LogManager implements AutoCloseable {
 
     public int getForceCount() {
         return forceCount.get();
+    }
+
+    public void setThreadTransactionContext(TransactionLogContext context) {
+        if (context == null) {
+            threadTxnContext.remove();
+        } else {
+            threadTxnContext.set(context);
+        }
+    }
+
+    public void clearThreadTransactionContext() {
+        threadTxnContext.remove();
+    }
+
+    public TransactionLogContext getThreadTransactionContext() {
+        return threadTxnContext.get();
     }
 
     private void ensureOpenLocked() {

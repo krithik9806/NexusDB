@@ -199,5 +199,18 @@ The Write-Ahead Log (`LogManager`, `LogRecord`, `LogReader` in `io.nexusdb.core.
 
 - **Torn-Write & Corrupt-Tail Handling**: `LogReader` validates `magic == 0x57414C52`, `payloadLength` bounds, file remaining bytes, and `CRC32` over `[magic + payloadLength + payload]`. If a crash leaves a partial or corrupted record at the tail of the WAL file, `LogReader` stops cleanly at the last valid record boundary (`validEndOffset`) and truncates the trailing bytes when opened in recovery/repair mode.
 
+### Write-Ahead Protocol, Dirty Page Table & Fuzzy Checkpoints
+
+1. **Write-Ahead Rule (`flushedLSN >= pageLSN`)**:
+   - Every mutation to a `TableHeap`, `BPlusTree`, or `Catalog` page appends a WAL record to `LogManager` first and stamps `page.setPageLsn(lsn)`.
+   - Before `BufferPoolManager` writes any dirty frame to `DiskManager` (during LRU eviction, `flushPage`, or `flushAll`), it invokes `LogManager.flushUpTo(pageLsn)` and asserts `logManager.getFlushedLsn() >= pageLsn`.
+2. **Dirty Page Table (DPT)**:
+   - `BufferPoolManager` maintains an in-memory `dirtyPageTable` mapping each currently dirty `pageId` to its `recLsn`—the LSN of the **first** WAL record that dirtied the page since it was last flushed to disk (`dirtyPageTable.putIfAbsent(pageId, lsn)`).
+   - Subsequent modifications to an already-dirty page advance `page.getPageLsn()` without overwriting its `recLsn` in the DPT. Writing the page to disk clears its dirty flag and removes `pageId` from the DPT.
+3. **Fuzzy Checkpoint & Log Truncation Policy (`CheckpointManager`)**:
+   - A fuzzy checkpoint writes `CHECKPOINT_BEGIN` (`beginLsn`), snapshots the current `DirtyPageTable` (`pageId -> recLsn`) and `ActiveTransactionTable` (`txnId -> lastLsn`) without stalling execution to force dirty data pages to disk, writes `CHECKPOINT_END(dpt, att)` (`endLsn`), forces the WAL up to `endLsn`, and stores `beginLsn` in Page 0's `checkpointLsn` header field.
+   - **Log Truncation Boundary**: During recovery, the Redo pass must scan from $\min(\{ \text{beginLsn} \} \cup \{ \text{recLsn} \in \text{DPT} \})$, while the Undo pass must reach the earliest `BEGIN` LSN of any transaction in the `ATT`. Only WAL segments strictly preceding both `minRecLsn` and the earliest active transaction's start LSN are eligible for truncation/compaction.
+
+
 
 
