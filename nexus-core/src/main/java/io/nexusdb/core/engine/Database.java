@@ -13,6 +13,9 @@ import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
 import io.nexusdb.core.storage.DiskManager;
+import io.nexusdb.core.transaction.Transaction;
+import io.nexusdb.core.transaction.TransactionManager;
+import io.nexusdb.core.transaction.TransactionState;
 import io.nexusdb.core.wal.CheckpointManager;
 import io.nexusdb.core.wal.LogManager;
 
@@ -24,12 +27,19 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Embedded relational database facade wiring {@link DiskManager}, {@link BufferPoolManager},
- * {@link Catalog}, {@link Parser}, {@link Binder}, {@link ExecutionPlanner}, and Volcano {@link Executor}s.
+ * Embedded relational database facade wiring {@link DiskManager}, {@link LogManager},
+ * {@link BufferPoolManager}, {@link CheckpointManager}, {@link Catalog}, {@link TransactionManager},
+ * {@link Parser}, {@link Binder}, {@link ExecutionPlanner}, and Volcano {@link Executor}s.
  *
- * <p>Thread-Safety Invariant:
- * Statement execution through {@link #execute(String)} and {@link #executeScript(String)} is synchronized
- * on {@code executionLock} until transaction concurrency control (Strict 2PL in Phase 4) is introduced.
+ * <p>Transaction & Concurrency Invariants:
+ * <ul>
+ *   <li>Statements executed outside an explicit {@code BEGIN ... COMMIT/ROLLBACK} block run in
+ *       autocommit mode, wrapping each DML modification in its own durable transaction.</li>
+ *   <li>Explicit transactions started via {@code BEGIN} are tracked per calling thread (or passed
+ *       explicitly via {@link #execute(Transaction, String)}). If a multi-row DML statement fails
+ *       midway (e.g. {@code DuplicateKeyException}), statement-level savepoint undo rolls back only
+ *       that statement's changes while keeping the enclosing explicit transaction active.</li>
+ * </ul>
  */
 public final class Database implements AutoCloseable {
     public static final int DEFAULT_BUFFER_POOL_SIZE = 128;
@@ -44,9 +54,11 @@ public final class Database implements AutoCloseable {
     private final BufferPoolManager bufferPoolManager;
     private final CheckpointManager checkpointManager;
     private final Catalog catalog;
+    private final TransactionManager transactionManager;
     private final Binder binder;
     private final ExecutionPlanner executionPlanner;
     private final Object executionLock = new Object();
+    private final ThreadLocal<Transaction> explicitThreadTxn = new ThreadLocal<>();
     private volatile boolean closed;
 
     private Database(
@@ -54,12 +66,14 @@ public final class Database implements AutoCloseable {
             LogManager logManager,
             BufferPoolManager bufferPoolManager,
             CheckpointManager checkpointManager,
-            Catalog catalog) {
+            Catalog catalog,
+            TransactionManager transactionManager) {
         this.diskManager = diskManager;
         this.logManager = logManager;
         this.bufferPoolManager = bufferPoolManager;
         this.checkpointManager = checkpointManager;
         this.catalog = catalog;
+        this.transactionManager = transactionManager;
         this.binder = new Binder(catalog);
         this.executionPlanner = new ExecutionPlanner();
     }
@@ -82,9 +96,10 @@ public final class Database implements AutoCloseable {
             lm = LogManager.open(walFile);
             BufferPoolManager bpm = new BufferPoolManager(bufferPoolSize, dm);
             bpm.setLogManager(lm);
-            CheckpointManager ckpt = new CheckpointManager(lm, bpm, dm);
             Catalog catalog = Catalog.open(bpm);
-            return new Database(dm, lm, bpm, ckpt, catalog);
+            TransactionManager tm = new TransactionManager(lm, catalog);
+            CheckpointManager ckpt = new CheckpointManager(lm, bpm, dm, tm::getActiveTransactionTable);
+            return new Database(dm, lm, bpm, ckpt, catalog, tm);
         } catch (RuntimeException e) {
             if (lm != null) {
                 try {
@@ -122,6 +137,28 @@ public final class Database implements AutoCloseable {
     }
 
     /**
+     * Executes one or more SQL statements within the context of the specified explicit {@link Transaction}.
+     */
+    public ResultSet execute(Transaction txn, String sql) {
+        Objects.requireNonNull(txn, "txn must not be null");
+        Objects.requireNonNull(sql, "sql must not be null");
+        if (txn.getState() != TransactionState.ACTIVE) {
+            throw new IllegalStateException("Transaction is not active: " + txn);
+        }
+        Transaction prev = explicitThreadTxn.get();
+        explicitThreadTxn.set(txn);
+        try {
+            return execute(sql);
+        } finally {
+            if (prev != null && prev.getState() == TransactionState.ACTIVE) {
+                explicitThreadTxn.set(prev);
+            } else {
+                explicitThreadTxn.remove();
+            }
+        }
+    }
+
+    /**
      * Executes all semicolon-separated statements in {@code sqlScript} sequentially and returns
      * their corresponding {@link ResultSet}s.
      */
@@ -146,6 +183,42 @@ public final class Database implements AutoCloseable {
 
     private ResultSet executeBoundLocked(BoundStatement bound, long startNanos) {
         return switch (bound) {
+            case BoundStatement.BoundBegin ignored -> {
+                Transaction current = getActiveExplicitThreadTxn();
+                if (current != null) {
+                    throw new IllegalStateException("Transaction is already active (txnId=" + current.getTxnId() + ")");
+                }
+                Transaction txn = transactionManager.begin(false);
+                explicitThreadTxn.set(txn);
+                long elapsed = System.nanoTime() - startNanos;
+                yield new ResultSet(List.of(), List.of(), 0, elapsed, "BEGIN");
+            }
+            case BoundStatement.BoundCommit ignored -> {
+                Transaction current = getActiveExplicitThreadTxn();
+                if (current == null) {
+                    throw new IllegalStateException("No active transaction to COMMIT");
+                }
+                try {
+                    transactionManager.commit(current);
+                } finally {
+                    explicitThreadTxn.remove();
+                }
+                long elapsed = System.nanoTime() - startNanos;
+                yield new ResultSet(List.of(), List.of(), 0, elapsed, "COMMIT");
+            }
+            case BoundStatement.BoundRollback ignored -> {
+                Transaction current = getActiveExplicitThreadTxn();
+                if (current == null) {
+                    throw new IllegalStateException("No active transaction to ROLLBACK");
+                }
+                try {
+                    transactionManager.rollback(current);
+                } finally {
+                    explicitThreadTxn.remove();
+                }
+                long elapsed = System.nanoTime() - startNanos;
+                yield new ResultSet(List.of(), List.of(), 0, elapsed, "ROLLBACK");
+            }
             case BoundStatement.BoundCreateDatabase(String dbName) -> {
                 long elapsed = System.nanoTime() - startNanos;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, "CREATE DATABASE " + dbName);
@@ -206,22 +279,56 @@ public final class Database implements AutoCloseable {
         };
     }
 
+    private Transaction getActiveExplicitThreadTxn() {
+        Transaction txn = explicitThreadTxn.get();
+        if (txn != null && txn.getState() != TransactionState.ACTIVE) {
+            explicitThreadTxn.remove();
+            return null;
+        }
+        return txn;
+    }
+
     private ResultSet executeDmlLocked(String tag, BoundStatement dml, long startNanos) {
+        Transaction explicitTxn = getActiveExplicitThreadTxn();
+        if (explicitTxn != null) {
+            int savepoint = explicitTxn.getLoggedModificationCount();
+            transactionManager.bindToCurrentThread(explicitTxn);
+            try (Executor executor = executionPlanner.plan(dml)) {
+                executor.init();
+                Tuple resultTuple = executor.next();
+                int affected = resultTuple != null ? ((Value.IntValue) resultTuple.getValue(0)).value() : 0;
+                long elapsed = System.nanoTime() - startNanos;
+                return new ResultSet(List.of(), List.of(), affected, elapsed, tag + " " + affected);
+            } catch (RuntimeException e) {
+                transactionManager.rollbackToSavepoint(explicitTxn, savepoint);
+                throw e;
+            } finally {
+                transactionManager.unbindFromCurrentThread();
+            }
+        }
+
+        Transaction autoTxn = transactionManager.begin(true);
         try (Executor executor = executionPlanner.plan(dml)) {
             executor.init();
             Tuple resultTuple = executor.next();
             int affected = resultTuple != null ? ((Value.IntValue) resultTuple.getValue(0)).value() : 0;
+            transactionManager.commit(autoTxn);
             long elapsed = System.nanoTime() - startNanos;
             return new ResultSet(List.of(), List.of(), affected, elapsed, tag + " " + affected);
+        } catch (RuntimeException e) {
+            transactionManager.rollback(autoTxn);
+            throw e;
+        } finally {
+            transactionManager.unbindFromCurrentThread();
         }
     }
 
     private ResultSet executeExplainLocked(boolean analyze, BoundStatement inner, long startNanos) {
         String planText = switch (inner) {
-            case BoundStatement.BoundSelect ignored -> explainBoundDmlOrSelect(analyze, inner, startNanos);
-            case BoundStatement.BoundInsert ignored -> explainBoundDmlOrSelect(analyze, inner, startNanos);
-            case BoundStatement.BoundUpdate ignored -> explainBoundDmlOrSelect(analyze, inner, startNanos);
-            case BoundStatement.BoundDelete ignored -> explainBoundDmlOrSelect(analyze, inner, startNanos);
+            case BoundStatement.BoundSelect ignored -> explainBoundDmlOrSelect(analyze, inner, false);
+            case BoundStatement.BoundInsert ignored -> explainBoundDmlOrSelect(analyze, inner, true);
+            case BoundStatement.BoundUpdate ignored -> explainBoundDmlOrSelect(analyze, inner, true);
+            case BoundStatement.BoundDelete ignored -> explainBoundDmlOrSelect(analyze, inner, true);
             default -> inner.getClass().getSimpleName();
         };
 
@@ -233,16 +340,74 @@ public final class Database implements AutoCloseable {
         return new ResultSet(EXPLAIN_COLUMNS, planRows, 0, elapsed, "EXPLAIN");
     }
 
-    private String explainBoundDmlOrSelect(boolean analyze, BoundStatement inner, long startNanos) {
-        try (Executor exec = executionPlanner.plan(inner)) {
-            if (!analyze) {
+    private String explainBoundDmlOrSelect(boolean analyze, BoundStatement inner, boolean isDml) {
+        if (!analyze) {
+            try (Executor exec = executionPlanner.plan(inner)) {
                 return exec.explain(0);
             }
+        }
+        if (!isDml) {
+            try (Executor exec = executionPlanner.plan(inner)) {
+                exec.init();
+                while (exec.next() != null) {
+                    // Consume all tuples to record actualRows and timeMs at each operator node
+                }
+                return exec.explain(0);
+            }
+        }
+
+        Transaction explicitTxn = getActiveExplicitThreadTxn();
+        if (explicitTxn != null) {
+            int savepoint = explicitTxn.getLoggedModificationCount();
+            transactionManager.bindToCurrentThread(explicitTxn);
+            try (Executor exec = executionPlanner.plan(inner)) {
+                exec.init();
+                while (exec.next() != null) {
+                }
+                return exec.explain(0);
+            } catch (RuntimeException e) {
+                transactionManager.rollbackToSavepoint(explicitTxn, savepoint);
+                throw e;
+            } finally {
+                transactionManager.unbindFromCurrentThread();
+            }
+        }
+
+        Transaction autoTxn = transactionManager.begin(true);
+        try (Executor exec = executionPlanner.plan(inner)) {
             exec.init();
             while (exec.next() != null) {
-                // Consume all tuples to record actualRows and timeMs at each operator node
             }
+            transactionManager.commit(autoTxn);
             return exec.explain(0);
+        } catch (RuntimeException e) {
+            transactionManager.rollback(autoTxn);
+            throw e;
+        } finally {
+            transactionManager.unbindFromCurrentThread();
+        }
+    }
+
+    public Transaction beginTransaction() {
+        synchronized (executionLock) {
+            ensureOpen();
+            Transaction txn = transactionManager.begin(false);
+            transactionManager.unbindFromCurrentThread();
+            return txn;
+        }
+    }
+
+    public void commitTransaction(Transaction txn) {
+        synchronized (executionLock) {
+            ensureOpen();
+            transactionManager.commit(txn);
+        }
+    }
+
+    public void rollbackTransaction(Transaction txn) {
+        synchronized (executionLock) {
+            ensureOpen();
+            transactionManager.rollback(txn);
         }
     }
 
@@ -264,6 +429,10 @@ public final class Database implements AutoCloseable {
 
     public CheckpointManager getCheckpointManager() {
         return checkpointManager;
+    }
+
+    public TransactionManager getTransactionManager() {
+        return transactionManager;
     }
 
     public CheckpointManager.CheckpointResult checkpoint() {
@@ -291,6 +460,7 @@ public final class Database implements AutoCloseable {
         synchronized (executionLock) {
             if (!closed) {
                 closed = true;
+                explicitThreadTxn.remove();
                 try {
                     bufferPoolManager.close();
                 } finally {

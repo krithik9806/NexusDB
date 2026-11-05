@@ -13,12 +13,11 @@ import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
+import io.nexusdb.core.wal.LogManager;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.Set;
 
 /**
  * Physical {@code INSERT} operator that evaluates bound row expressions, validates runtime
@@ -80,32 +79,51 @@ public final class InsertExecutor implements Executor {
                 tuplesToInsert.add(new Tuple(values));
             }
 
-            for (IndexMetadata idx : indexes) {
-                if (!idx.unique()) {
-                    continue;
+            LogManager lm = heap.getBufferPoolManager().getLogManager();
+            boolean managedByTxn = lm != null && lm.getThreadTransactionContext() != null;
+
+            List<InsertedRowRecord> localInserted = managedByTxn ? null : new ArrayList<>(tuplesToInsert.size());
+            int count = 0;
+            try {
+                for (Tuple tuple : tuplesToInsert) {
+                    RecordId rid = heap.insert(tuple);
+                    int idxPos = 0;
+                    try {
+                        for (; idxPos < indexes.size(); idxPos++) {
+                            IndexMetadata idx = indexes.get(idxPos);
+                            int colIdx = schema.getColumnIndex(idx.columnName());
+                            BPlusTree tree = table.getIndexTree(idx);
+                            tree.insert(tuple.getValue(colIdx), rid);
+                        }
+                    } catch (DuplicateKeyException dup) {
+                        // Remove from any indexes on the current row that already succeeded before this index failed
+                        for (int j = 0; j < idxPos; j++) {
+                            IndexMetadata prevIdx = indexes.get(j);
+                            int prevColIdx = schema.getColumnIndex(prevIdx.columnName());
+                            table.getIndexTree(prevIdx).delete(tuple.getValue(prevColIdx), rid);
+                        }
+                        if (!managedByTxn) {
+                            heap.delete(rid);
+                        }
+                        throw dup;
+                    }
+                    if (localInserted != null) {
+                        localInserted.add(new InsertedRowRecord(rid, tuple));
+                    }
+                    count++;
                 }
-                int colIdx = schema.getColumnIndex(idx.columnName());
-                BPlusTree tree = table.getIndexTree(idx);
-                Set<Value> batchSeen = new HashSet<>();
-                for (Tuple candidate : tuplesToInsert) {
-                    Value keyVal = candidate.getValue(colIdx);
-                    if (!batchSeen.add(keyVal) || !tree.search(keyVal).isEmpty()) {
-                        throw new DuplicateKeyException(
-                                "Duplicate key '" + keyVal + "' violates unique index '"
-                                        + idx.indexName() + "' on column '" + idx.columnName() + "'");
+            } catch (RuntimeException e) {
+                if (localInserted != null) {
+                    for (int i = localInserted.size() - 1; i >= 0; i--) {
+                        InsertedRowRecord rec = localInserted.get(i);
+                        heap.delete(rec.rid());
+                        for (IndexMetadata idx : indexes) {
+                            int colIdx = schema.getColumnIndex(idx.columnName());
+                            table.getIndexTree(idx).delete(rec.tuple().getValue(colIdx), rec.rid());
+                        }
                     }
                 }
-            }
-
-            int count = 0;
-            for (Tuple tuple : tuplesToInsert) {
-                RecordId rid = heap.insert(tuple);
-                for (IndexMetadata idx : indexes) {
-                    int colIdx = schema.getColumnIndex(idx.columnName());
-                    BPlusTree tree = table.getIndexTree(idx);
-                    tree.insert(tuple.getValue(colIdx), rid);
-                }
-                count++;
+                throw e;
             }
 
             this.actualRows = count;
@@ -114,6 +132,8 @@ public final class InsertExecutor implements Executor {
             elapsedNanos += System.nanoTime() - start;
         }
     }
+
+    private record InsertedRowRecord(RecordId rid, Tuple tuple) {}
 
     static Value validateAndCoerceColumnValue(Value val, Column col) {
         if (val == null || val.isNull()) {

@@ -16,6 +16,9 @@ public sealed interface Statement
                 Statement.SelectStatement,
                 Statement.UpdateStatement,
                 Statement.DeleteStatement,
+                Statement.BeginStatement,
+                Statement.CommitStatement,
+                Statement.RollbackStatement,
                 Statement.ExplainStatement {
 
     /**
@@ -165,6 +168,24 @@ public sealed interface Statement
                 throw new IllegalArgumentException("tableName must not be blank");
             }
         }
+    }
+
+    /**
+     * {@code BEGIN}
+     */
+    record BeginStatement() implements Statement {
+    }
+
+    /**
+     * {@code COMMIT}
+     */
+    record CommitStatement() implements Statement {
+    }
+
+    /**
+     * {@code ROLLBACK}
+     */
+    record RollbackStatement() implements Statement {
     }
 
     /**

@@ -211,6 +211,18 @@ The Write-Ahead Log (`LogManager`, `LogRecord`, `LogReader` in `io.nexusdb.core.
    - A fuzzy checkpoint writes `CHECKPOINT_BEGIN` (`beginLsn`), snapshots the current `DirtyPageTable` (`pageId -> recLsn`) and `ActiveTransactionTable` (`txnId -> lastLsn`) without stalling execution to force dirty data pages to disk, writes `CHECKPOINT_END(dpt, att)` (`endLsn`), forces the WAL up to `endLsn`, and stores `beginLsn` in Page 0's `checkpointLsn` header field.
    - **Log Truncation Boundary**: During recovery, the Redo pass must scan from $\min(\{ \text{beginLsn} \} \cup \{ \text{recLsn} \in \text{DPT} \})$, while the Undo pass must reach the earliest `BEGIN` LSN of any transaction in the `ATT`. Only WAL segments strictly preceding both `minRecLsn` and the earliest active transaction's start LSN are eligible for truncation/compaction.
 
+### Transaction Management, Commit & Undo Rollback (`TransactionManager`)
+
+1. **Transaction Lifecycle (`Transaction`, `TransactionState`)**:
+   - Each transaction (`txnId >= 1`) starts in `ACTIVE` state, appends a `BEGIN` WAL record, and links every subsequent modification (`INSERT`, `UPDATE`, `DELETE`, `CLR`) through its `prevLsn` chain (`lastLsn`).
+   - SQL sessions execute in **autocommit** mode by default (wrapping each individual DML statement in an implicit transaction) or in explicit multi-statement mode initiated by `BEGIN [TRANSACTION]` and terminated by `COMMIT [TRANSACTION]` or `ROLLBACK [TRANSACTION]`.
+2. **Commit Protocol (`TransactionManager.commit`)**:
+   - Appends a `COMMIT` WAL record linked to `txn.getLastLsn()`, forces the WAL up to `commitLsn` (`logManager.flushUpTo(commitLsn)`), transitions state to `COMMITTED`, and removes the transaction from the Active Transaction Table (`ATT`). Under the **No-Force** buffer pool policy, dirty data pages do not need to be flushed to disk at commit time.
+3. **Rollback & Statement-Level Atomicity (`TransactionManager.rollback` / `rollbackToLsn`)**:
+   - Walking `txn.getUndoRecords()` in reverse LSN order (`LIFO`), each logged tuple modification is inverted on its slotted heap page (`INSERT` $\rightarrow$ `SlottedPage.delete(slotId)`; `DELETE`/`UPDATE` $\rightarrow$ `SlottedPage.putSlot(slotId, beforeImage)`), a Compensation Log Record (`CLR`) is appended with `undoNextLsn = record.prevLsn()`, the page's `pageLSN` is updated to `clrLsn`, and all affected B+Tree indexes on the modified tables are rebuilt/synchronized with the restored heap.
+   - Full rollback finishes by writing an `ABORT` WAL record and transitioning the transaction to `ABORTED`. When a multi-row `INSERT` or `UPDATE` fails mid-statement (e.g., `DuplicateKeyException`) inside an explicit `BEGIN` block, `rollbackToLsn(txn, statementSavepointLsn)` undoes only the failed statement's changes while keeping earlier statements in the transaction intact.
+
+
 
 
 

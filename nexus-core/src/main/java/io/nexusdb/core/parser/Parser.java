@@ -125,6 +125,18 @@ public final class Parser {
             case SELECT -> parseSelect();
             case UPDATE -> parseUpdate();
             case DELETE -> parseDelete();
+            case BEGIN -> {
+                consume(TokenType.BEGIN, "Expected 'BEGIN'");
+                yield new Statement.BeginStatement();
+            }
+            case COMMIT -> {
+                consume(TokenType.COMMIT, "Expected 'COMMIT'");
+                yield new Statement.CommitStatement();
+            }
+            case ROLLBACK -> {
+                consume(TokenType.ROLLBACK, "Expected 'ROLLBACK'");
+                yield new Statement.RollbackStatement();
+            }
             default -> throw error(peek(), "Unexpected token '" + peek().lexeme() + "' at start of statement");
         };
     }

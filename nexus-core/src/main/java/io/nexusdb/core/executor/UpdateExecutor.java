@@ -11,6 +11,7 @@ import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
+import io.nexusdb.core.wal.LogManager;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -99,27 +100,64 @@ public final class UpdateExecutor implements Executor {
                 newTuples.add(new Tuple(newValues, existing.getRecordId()));
             }
 
-            for (IndexMetadata idx : indexes) {
-                if (!idx.unique()) {
-                    continue;
-                }
-                int colIdx = schema.getColumnIndex(idx.columnName());
-                BPlusTree tree = table.getIndexTree(idx);
-                Set<Value> updatedKeyBatch = new HashSet<>();
+            LogManager lm = heap.getBufferPoolManager().getLogManager();
+            boolean managedByTxn = lm != null && lm.getThreadTransactionContext() != null;
 
-                for (Tuple updated : newTuples) {
-                    Value newKey = updated.getValue(colIdx);
-                    if (!updatedKeyBatch.add(newKey)) {
-                        throw new DuplicateKeyException(
-                                "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
-                                        + idx.indexName() + "' on column '" + idx.columnName() + "'");
+            if (!managedByTxn) {
+                for (IndexMetadata idx : indexes) {
+                    if (!idx.unique()) {
+                        continue;
                     }
-                    List<RecordId> existingMatches = tree.search(newKey);
-                    for (RecordId matchRid : existingMatches) {
-                        if (!targetRidSet.contains(matchRid)) {
+                    int colIdx = schema.getColumnIndex(idx.columnName());
+                    BPlusTree tree = table.getIndexTree(idx);
+                    Set<Value> updatedKeyBatch = new HashSet<>();
+                    for (Tuple updated : newTuples) {
+                        Value newKey = updated.getValue(colIdx);
+                        if (!updatedKeyBatch.add(newKey)) {
                             throw new DuplicateKeyException(
                                     "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
                                             + idx.indexName() + "' on column '" + idx.columnName() + "'");
+                        }
+                        for (RecordId matchRid : tree.search(newKey)) {
+                            if (!targetRidSet.contains(matchRid)) {
+                                throw new DuplicateKeyException(
+                                        "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
+                                                + idx.indexName() + "' on column '" + idx.columnName() + "'");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Apply updates to heap and check unique index constraints as each row is updated
+            List<RecordId> updatedRids = new ArrayList<>(targets.size());
+            for (int i = 0; i < targets.size(); i++) {
+                Tuple oldTuple = targets.get(i);
+                Tuple updatedTuple = newTuples.get(i);
+                RecordId newRid = heap.update(oldTuple.getRecordId(), updatedTuple);
+                updatedRids.add(newRid);
+
+                if (managedByTxn) {
+                    for (IndexMetadata idx : indexes) {
+                        if (!idx.unique()) {
+                            continue;
+                        }
+                        int colIdx = schema.getColumnIndex(idx.columnName());
+                        Value newKey = updatedTuple.getValue(colIdx);
+                        for (int prev = 0; prev < i; prev++) {
+                            if (newTuples.get(prev).getValue(colIdx).equals(newKey)) {
+                                throw new DuplicateKeyException(
+                                        "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
+                                                + idx.indexName() + "' on column '" + idx.columnName() + "'");
+                            }
+                        }
+                        BPlusTree tree = table.getIndexTree(idx);
+                        for (RecordId matchRid : tree.search(newKey)) {
+                            if (!targetRidSet.contains(matchRid)) {
+                                throw new DuplicateKeyException(
+                                        "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
+                                                + idx.indexName() + "' on column '" + idx.columnName() + "'");
+                            }
                         }
                     }
                 }
@@ -135,21 +173,18 @@ public final class UpdateExecutor implements Executor {
                 }
             }
 
-            int updatedCount = 0;
             for (int i = 0; i < targets.size(); i++) {
-                Tuple oldTuple = targets.get(i);
                 Tuple updatedTuple = newTuples.get(i);
-                RecordId newRid = heap.update(oldTuple.getRecordId(), updatedTuple);
+                RecordId newRid = updatedRids.get(i);
                 for (IndexMetadata idx : indexes) {
                     int colIdx = schema.getColumnIndex(idx.columnName());
                     BPlusTree tree = table.getIndexTree(idx);
                     tree.insert(updatedTuple.getValue(colIdx), newRid);
                 }
-                updatedCount++;
             }
 
-            this.actualRows = updatedCount;
-            return new Tuple(Value.ofInt(updatedCount));
+            this.actualRows = targets.size();
+            return new Tuple(Value.ofInt(targets.size()));
         } finally {
             elapsedNanos += System.nanoTime() - start;
         }

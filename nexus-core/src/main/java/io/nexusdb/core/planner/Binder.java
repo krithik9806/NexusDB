@@ -56,6 +56,9 @@ public final class Binder {
             case Statement.SelectStatement select -> bindSelect(select);
             case Statement.UpdateStatement update -> bindUpdate(update);
             case Statement.DeleteStatement delete -> bindDelete(delete);
+            case Statement.BeginStatement ignored -> new BoundStatement.BoundBegin();
+            case Statement.CommitStatement ignored -> new BoundStatement.BoundCommit();
+            case Statement.RollbackStatement ignored -> new BoundStatement.BoundRollback();
             case Statement.ExplainStatement explain ->
                     new BoundStatement.BoundExplain(explain.analyze(), bind(explain.statement()));
         };

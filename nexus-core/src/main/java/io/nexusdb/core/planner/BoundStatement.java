@@ -19,6 +19,9 @@ public sealed interface BoundStatement
                 BoundStatement.BoundSelect,
                 BoundStatement.BoundUpdate,
                 BoundStatement.BoundDelete,
+                BoundStatement.BoundBegin,
+                BoundStatement.BoundCommit,
+                BoundStatement.BoundRollback,
                 BoundStatement.BoundExplain {
 
     record BoundCreateDatabase(String databaseName) implements BoundStatement {
@@ -131,6 +134,15 @@ public sealed interface BoundStatement
         public BoundDelete {
             Objects.requireNonNull(table, "table must not be null");
         }
+    }
+
+    record BoundBegin() implements BoundStatement {
+    }
+
+    record BoundCommit() implements BoundStatement {
+    }
+
+    record BoundRollback() implements BoundStatement {
     }
 
     record BoundExplain(

@@ -91,6 +91,9 @@ public final class AstPrinter {
                 }
                 yield sb.toString();
             }
+            case Statement.BeginStatement ignored -> "BEGIN";
+            case Statement.CommitStatement ignored -> "COMMIT";
+            case Statement.RollbackStatement ignored -> "ROLLBACK";
             case Statement.ExplainStatement(boolean analyze, Statement inner) ->
                     (analyze ? "EXPLAIN ANALYZE " : "EXPLAIN ") + print(inner);
         };
