@@ -60,6 +60,21 @@ All write operations (DDL `CREATE TABLE`, `DROP TABLE`, and DML `INSERT`, `UPDAT
 - **Leader Reads (Default)**: Consistent reads execute directly on the leader, guaranteeing that all previously committed writes are visible.
 - **Follower Reads (Stale)**: Follower reads can be served locally for read-scaling if the client permits reads up to the follower's `lastApplied` index.
 
+---
+
+## 4. Failure Recovery & Fault Injection
+
+### Recovery Policy & Rejoin Catch-up
+- **Heartbeat Failure Detection**: Nodes monitor heartbeats within a randomized timeout window ($[150, 300\text{ ms}]$). If a leader fails, remaining nodes detect heartbeat cessation and initiate a new election.
+- **Node Rejoin & Log Catch-Up**: When a partitioned or crashed follower rejoins, the leader uses its `nextIndex[peer]` and fast conflict backtracking to transmit missing entries from its log. The rejoining follower appends missing entries and advances `commitIndex` once instructed by the leader, restoring cluster consistency without requiring a full snapshot.
+- **Single History Invariant**: If a partitioned minority leader attempts to accept writes, it cannot achieve quorum commit. Upon network heal, it steps down to follower upon observing a higher term, discards any uncommitted local entries, and adopts the canonical history established by the majority.
+
+### Transport Fault Injection
+The `AdminService` gRPC endpoint enables dynamic fault simulation:
+- `DROP_TRAFFIC`: Simulates network partitions or isolated nodes by intercepting and silently discarding outbound RPCs to specific peers.
+- `ADD_LATENCY`: Injects artificial network delay into inter-node transport.
+- `CLEAR_FAULTS`: Resets all active simulated faults.
+
 To keep the consensus core deterministic, inspectable, and robust, the following advanced Raft extensions are currently not implemented:
 - **Log Compaction / Snapshots (`InstallSnapshot` RPC)**: Log entries accumulate in `RaftStorage` and are retained across restarts. Snapshotting and log truncation will be evaluated in future phases.
 - **Dynamic Membership Changes (Joint Consensus / Single-Server Transitions)**: Cluster membership is statically configured at startup via node IDs and peer lists. Adding or removing nodes dynamically requires cluster restart.

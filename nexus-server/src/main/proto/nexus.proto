@@ -93,3 +93,46 @@ message NodeHealthResponse {
   int64 current_term = 6;
   int64 commit_index = 7;
 }
+
+// --- Cluster Admin & Fault Injection Service ---
+
+service AdminService {
+  rpc GetClusterMembership (ClusterMembershipRequest) returns (ClusterMembershipResponse);
+  rpc InjectFault (FaultInjectionRequest) returns (FaultInjectionResponse);
+}
+
+message ClusterMembershipRequest {
+}
+
+message PeerReplicationStatus {
+  string peer_id = 1;
+  int64 match_index = 2;
+  int64 lag = 3;
+  bool is_alive = 4;
+}
+
+message ClusterMembershipResponse {
+  string node_id = 1;
+  string role = 2;
+  int64 current_term = 3;
+  int64 leader_commit_index = 4;
+  repeated PeerReplicationStatus peers = 5;
+}
+
+enum FaultType {
+  NONE = 0;
+  DROP_TRAFFIC = 1;
+  ADD_LATENCY = 2;
+  CLEAR_FAULTS = 3;
+}
+
+message FaultInjectionRequest {
+  string target_node_id = 1;
+  FaultType fault_type = 2;
+  int64 latency_ms = 3;
+}
+
+message FaultInjectionResponse {
+  bool success = 1;
+  string message = 2;
+}

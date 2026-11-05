@@ -29,6 +29,7 @@ import java.util.function.Consumer;
  */
 public final class GrpcRaftTransport implements RaftTransport, AutoCloseable {
     private final String localNodeId;
+    private final io.nexusdb.server.admin.FaultInjector faultInjector;
     private final Map<String, String> peerEndpoints = new ConcurrentHashMap<>();
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
     private final Map<String, RaftServiceGrpc.RaftServiceBlockingStub> stubs = new ConcurrentHashMap<>();
@@ -38,7 +39,16 @@ public final class GrpcRaftTransport implements RaftTransport, AutoCloseable {
     public record RaftMessageDelivery(String fromNodeId, RaftMessage message) {}
 
     public GrpcRaftTransport(String localNodeId) {
+        this(localNodeId, new io.nexusdb.server.admin.FaultInjector());
+    }
+
+    public GrpcRaftTransport(String localNodeId, io.nexusdb.server.admin.FaultInjector faultInjector) {
         this.localNodeId = Objects.requireNonNull(localNodeId, "localNodeId must not be null");
+        this.faultInjector = Objects.requireNonNull(faultInjector, "faultInjector must not be null");
+    }
+
+    public io.nexusdb.server.admin.FaultInjector getFaultInjector() {
+        return faultInjector;
     }
 
     public void registerPeer(String peerId, String host, int port) {
@@ -63,6 +73,10 @@ public final class GrpcRaftTransport implements RaftTransport, AutoCloseable {
 
     @Override
     public void send(String fromNodeId, String toNodeId, RaftMessage message) {
+        if (faultInjector.isDropping(toNodeId)) {
+            return;
+        }
+
         RaftServiceGrpc.RaftServiceBlockingStub stub = stubs.get(toNodeId);
         if (stub == null) {
             return;
@@ -70,6 +84,11 @@ public final class GrpcRaftTransport implements RaftTransport, AutoCloseable {
 
         executor.submit(() -> {
             try {
+                long latency = faultInjector.getLatency(toNodeId);
+                if (latency > 0) {
+                    Thread.sleep(latency);
+                }
+
                 if (message instanceof RaftMessage.RequestVoteRequest req) {
                     RequestVoteArgs args = RequestVoteArgs.newBuilder()
                             .setCandidateId(req.candidateId())

@@ -41,6 +41,8 @@ public final class NexusNode implements AutoCloseable {
 
     private final RaftNode raftNode;
     private final GrpcRaftTransport raftTransport;
+    private final io.nexusdb.server.admin.FaultInjector faultInjector;
+    private final io.nexusdb.server.admin.ClusterMembershipView membershipView;
     private final ScheduledExecutorService tickerExecutor;
     private volatile boolean running;
 
@@ -115,6 +117,9 @@ public final class NexusNode implements AutoCloseable {
                 this.raftNode.handleMessage(delivery.fromNodeId(), delivery.message());
             });
 
+            this.faultInjector = this.raftTransport.getFaultInjector();
+            this.membershipView = new io.nexusdb.server.admin.ClusterMembershipView(this.raftNode);
+
             this.tickerExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "raft-ticker-" + nodeId);
                 t.setDaemon(true);
@@ -123,6 +128,8 @@ public final class NexusNode implements AutoCloseable {
         } else {
             this.raftNode = null;
             this.raftTransport = null;
+            this.faultInjector = null;
+            this.membershipView = null;
             this.tickerExecutor = null;
         }
 
@@ -140,6 +147,7 @@ public final class NexusNode implements AutoCloseable {
 
         if (raftNode != null) {
             builder.addService(new RaftServiceImpl(raftNode));
+            builder.addService(new io.nexusdb.server.admin.AdminServiceImpl(membershipView, faultInjector));
         }
 
         this.grpcServer = builder.build();
@@ -204,6 +212,14 @@ public final class NexusNode implements AutoCloseable {
 
     public RaftNode getRaftNode() {
         return raftNode;
+    }
+
+    public io.nexusdb.server.admin.FaultInjector getFaultInjector() {
+        return faultInjector;
+    }
+
+    public io.nexusdb.server.admin.ClusterMembershipView getMembershipView() {
+        return membershipView;
     }
 
     public boolean isRunning() {
