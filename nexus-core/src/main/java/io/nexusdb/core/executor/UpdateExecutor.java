@@ -22,22 +22,17 @@ import java.util.Set;
  * Physical {@code UPDATE} operator that updates matching tuples in a {@link TableHeap},
  * maintains all table {@link BPlusTree} indexes (including when tuples relocate across pages),
  * and emits a single tuple containing the number of updated rows.
- *
- * <p>Halloween Problem & Index Maintenance Invariant:
- * <ol>
- *   <li>All matching tuples from {@code child} are materialized and {@code child} is closed before
- *       any heap or index mutation occurs, preventing a scan from re-visiting relocated tuples.</li>
- *   <li>All unique indexes are pre-validated across the updated tuple set before mutating the heap
- *       or any index, guaranteeing no partial updates on {@link DuplicateKeyException}.</li>
- *   <li>When {@link TableHeap#update} relocates a growing variable-length tuple to a new
- *       {@link RecordId}, all indexes on the table (even those whose key value did not change)
- *       replace the old {@link RecordId} with the relocated {@link RecordId}.</li>
- * </ol>
  */
 public final class UpdateExecutor implements Executor {
     private final TableMetadata table;
     private final Executor child;
     private final List<BoundStatement.BoundAssignment> assignments;
+    private boolean consumed;
+
+    private double estimatedCost;
+    private long estimatedRows;
+    private long actualRows;
+    private long elapsedNanos;
     private boolean executed;
 
     public UpdateExecutor(
@@ -47,108 +42,117 @@ public final class UpdateExecutor implements Executor {
         this.table = Objects.requireNonNull(table, "table must not be null");
         this.child = Objects.requireNonNull(child, "child must not be null");
         this.assignments = List.copyOf(Objects.requireNonNull(assignments, "assignments must not be null"));
+        this.estimatedRows = child.getEstimatedRows();
+        this.estimatedCost = child.getEstimatedCost() + this.estimatedRows * (1.0 + table.getIndexes().size() * 0.5);
     }
 
     @Override
     public void init() {
-        this.executed = false;
+        long start = System.nanoTime();
+        this.consumed = false;
+        this.actualRows = 0L;
+        this.executed = true;
         child.init();
+        this.elapsedNanos = System.nanoTime() - start;
     }
 
     @Override
     public Tuple next() {
-        if (executed) {
+        if (consumed) {
             return null;
         }
-        executed = true;
-
-        List<Tuple> targets = new ArrayList<>();
+        consumed = true;
+        long start = System.nanoTime();
         try {
-            Tuple t;
-            while ((t = child.next()) != null) {
-                targets.add(t);
-            }
-        } finally {
-            child.close();
-        }
-
-        if (targets.isEmpty()) {
-            return new Tuple(Value.ofInt(0));
-        }
-
-        Schema schema = table.getSchema();
-        TableHeap heap = table.getTableHeap();
-        List<IndexMetadata> indexes = table.getIndexes();
-
-        List<Tuple> newTuples = new ArrayList<>(targets.size());
-        Set<RecordId> targetRidSet = new HashSet<>(targets.size() * 2);
-
-        for (Tuple existing : targets) {
-            targetRidSet.add(existing.getRecordId());
-            List<Value> newValues = new ArrayList<>(existing.getValues());
-            for (BoundStatement.BoundAssignment assignment : assignments) {
-                int colIdx = assignment.columnIndex();
-                Column col = schema.getColumn(colIdx);
-                Value evaluated = ExpressionEvaluator.evaluate(assignment.value(), existing);
-                Value validated = InsertExecutor.validateAndCoerceColumnValue(evaluated, col);
-                newValues.set(colIdx, validated);
-            }
-            newTuples.add(new Tuple(newValues, existing.getRecordId()));
-        }
-
-        // Pre-validate all unique indexes before mutating the heap or any index
-        for (IndexMetadata idx : indexes) {
-            if (!idx.unique()) {
-                continue;
-            }
-            int colIdx = schema.getColumnIndex(idx.columnName());
-            BPlusTree tree = table.getIndexTree(idx);
-            Set<Value> updatedKeyBatch = new HashSet<>();
-
-            for (Tuple updated : newTuples) {
-                Value newKey = updated.getValue(colIdx);
-                if (!updatedKeyBatch.add(newKey)) {
-                    throw new DuplicateKeyException(
-                            "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
-                                    + idx.indexName() + "' on column '" + idx.columnName() + "'");
+            List<Tuple> targets = new ArrayList<>();
+            try {
+                Tuple t;
+                while ((t = child.next()) != null) {
+                    targets.add(t);
                 }
-                List<RecordId> existingMatches = tree.search(newKey);
-                for (RecordId matchRid : existingMatches) {
-                    if (!targetRidSet.contains(matchRid)) {
+            } finally {
+                child.close();
+            }
+
+            if (targets.isEmpty()) {
+                this.actualRows = 0L;
+                return new Tuple(Value.ofInt(0));
+            }
+
+            Schema schema = table.getSchema();
+            TableHeap heap = table.getTableHeap();
+            List<IndexMetadata> indexes = table.getIndexes();
+
+            List<Tuple> newTuples = new ArrayList<>(targets.size());
+            Set<RecordId> targetRidSet = new HashSet<>(targets.size() * 2);
+
+            for (Tuple existing : targets) {
+                targetRidSet.add(existing.getRecordId());
+                List<Value> newValues = new ArrayList<>(existing.getValues());
+                for (BoundStatement.BoundAssignment assignment : assignments) {
+                    int colIdx = assignment.columnIndex();
+                    Column col = schema.getColumn(colIdx);
+                    Value evaluated = ExpressionEvaluator.evaluate(assignment.value(), existing);
+                    Value validated = InsertExecutor.validateAndCoerceColumnValue(evaluated, col);
+                    newValues.set(colIdx, validated);
+                }
+                newTuples.add(new Tuple(newValues, existing.getRecordId()));
+            }
+
+            for (IndexMetadata idx : indexes) {
+                if (!idx.unique()) {
+                    continue;
+                }
+                int colIdx = schema.getColumnIndex(idx.columnName());
+                BPlusTree tree = table.getIndexTree(idx);
+                Set<Value> updatedKeyBatch = new HashSet<>();
+
+                for (Tuple updated : newTuples) {
+                    Value newKey = updated.getValue(colIdx);
+                    if (!updatedKeyBatch.add(newKey)) {
                         throw new DuplicateKeyException(
                                 "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
                                         + idx.indexName() + "' on column '" + idx.columnName() + "'");
                     }
+                    List<RecordId> existingMatches = tree.search(newKey);
+                    for (RecordId matchRid : existingMatches) {
+                        if (!targetRidSet.contains(matchRid)) {
+                            throw new DuplicateKeyException(
+                                    "Duplicate key '" + newKey + "' in UPDATE violates unique index '"
+                                            + idx.indexName() + "' on column '" + idx.columnName() + "'");
+                        }
+                    }
                 }
             }
-        }
 
-        // Remove old index entries for all target rows before applying heap updates
-        for (int i = 0; i < targets.size(); i++) {
-            Tuple oldTuple = targets.get(i);
-            RecordId oldRid = oldTuple.getRecordId();
-            for (IndexMetadata idx : indexes) {
-                int colIdx = schema.getColumnIndex(idx.columnName());
-                BPlusTree tree = table.getIndexTree(idx);
-                tree.delete(oldTuple.getValue(colIdx), oldRid);
+            for (int i = 0; i < targets.size(); i++) {
+                Tuple oldTuple = targets.get(i);
+                RecordId oldRid = oldTuple.getRecordId();
+                for (IndexMetadata idx : indexes) {
+                    int colIdx = schema.getColumnIndex(idx.columnName());
+                    BPlusTree tree = table.getIndexTree(idx);
+                    tree.delete(oldTuple.getValue(colIdx), oldRid);
+                }
             }
-        }
 
-        // Apply heap updates and re-insert index entries with the (possibly relocated) RecordId
-        int updatedCount = 0;
-        for (int i = 0; i < targets.size(); i++) {
-            Tuple oldTuple = targets.get(i);
-            Tuple updatedTuple = newTuples.get(i);
-            RecordId newRid = heap.update(oldTuple.getRecordId(), updatedTuple);
-            for (IndexMetadata idx : indexes) {
-                int colIdx = schema.getColumnIndex(idx.columnName());
-                BPlusTree tree = table.getIndexTree(idx);
-                tree.insert(updatedTuple.getValue(colIdx), newRid);
+            int updatedCount = 0;
+            for (int i = 0; i < targets.size(); i++) {
+                Tuple oldTuple = targets.get(i);
+                Tuple updatedTuple = newTuples.get(i);
+                RecordId newRid = heap.update(oldTuple.getRecordId(), updatedTuple);
+                for (IndexMetadata idx : indexes) {
+                    int colIdx = schema.getColumnIndex(idx.columnName());
+                    BPlusTree tree = table.getIndexTree(idx);
+                    tree.insert(updatedTuple.getValue(colIdx), newRid);
+                }
+                updatedCount++;
             }
-            updatedCount++;
-        }
 
-        return new Tuple(Value.ofInt(updatedCount));
+            this.actualRows = updatedCount;
+            return new Tuple(Value.ofInt(updatedCount));
+        } finally {
+            elapsedNanos += System.nanoTime() - start;
+        }
     }
 
     @Override
@@ -162,8 +166,40 @@ public final class UpdateExecutor implements Executor {
     }
 
     @Override
+    public double getEstimatedCost() {
+        return estimatedCost;
+    }
+
+    @Override
+    public long getEstimatedRows() {
+        return estimatedRows;
+    }
+
+    @Override
+    public void setEstimates(double estimatedCost, long estimatedRows) {
+        this.estimatedCost = estimatedCost;
+        this.estimatedRows = estimatedRows;
+    }
+
+    @Override
+    public long getActualRows() {
+        return actualRows;
+    }
+
+    @Override
+    public long getElapsedNanos() {
+        return elapsedNanos;
+    }
+
+    @Override
+    public boolean isExecuted() {
+        return executed;
+    }
+
+    @Override
     public String explain(int indent) {
         String prefix = "  ".repeat(Math.max(0, indent));
-        return prefix + "Update(table=" + table.getName() + ")\n" + child.explain(indent + 1);
+        return prefix + "Update(table=" + table.getName() + ")" + formatMetrics()
+                + "\n" + child.explain(indent + 1);
     }
 }

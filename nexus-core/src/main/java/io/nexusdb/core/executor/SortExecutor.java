@@ -24,16 +24,28 @@ public final class SortExecutor implements Executor {
     private List<Tuple> sortedTuples;
     private int cursor;
 
+    private double estimatedCost;
+    private long estimatedRows;
+    private long actualRows;
+    private long elapsedNanos;
+    private boolean executed;
+
     public SortExecutor(Executor child, List<BoundStatement.BoundOrderBy> orderBy) {
         this.child = Objects.requireNonNull(child, "child must not be null");
         this.orderBy = List.copyOf(Objects.requireNonNull(orderBy, "orderBy must not be null"));
         if (this.orderBy.isEmpty()) {
             throw new IllegalArgumentException("orderBy must not be empty");
         }
+        this.estimatedRows = child.getEstimatedRows();
+        double logN = Math.max(1.0, Math.log(Math.max(2L, this.estimatedRows)) / Math.log(2.0));
+        this.estimatedCost = child.getEstimatedCost() + this.estimatedRows * logN * 0.02;
     }
 
     @Override
     public void init() {
+        long start = System.nanoTime();
+        this.actualRows = 0L;
+        this.executed = true;
         child.init();
         List<Tuple> buffer = new ArrayList<>();
         try {
@@ -47,6 +59,7 @@ public final class SortExecutor implements Executor {
         buffer.sort(this::compareTuples);
         this.sortedTuples = buffer;
         this.cursor = 0;
+        this.elapsedNanos = System.nanoTime() - start;
     }
 
     private int compareTuples(Tuple a, Tuple b) {
@@ -68,11 +81,9 @@ public final class SortExecutor implements Executor {
             return 0;
         }
         if (aNull) {
-            // ASC -> NULLS LAST (+1); DESC -> NULLS FIRST (-1)
             return ascending ? 1 : -1;
         }
         if (bNull) {
-            // ASC -> non-null before null (-1); DESC -> non-null after null (+1)
             return ascending ? -1 : 1;
         }
 
@@ -93,10 +104,16 @@ public final class SortExecutor implements Executor {
         if (sortedTuples == null) {
             throw new IllegalStateException("SortExecutor.init() must be called before next()");
         }
-        if (cursor >= sortedTuples.size()) {
-            return null;
+        long start = System.nanoTime();
+        try {
+            if (cursor >= sortedTuples.size()) {
+                return null;
+            }
+            actualRows++;
+            return sortedTuples.get(cursor++);
+        } finally {
+            elapsedNanos += System.nanoTime() - start;
         }
-        return sortedTuples.get(cursor++);
     }
 
     @Override
@@ -112,8 +129,40 @@ public final class SortExecutor implements Executor {
     }
 
     @Override
+    public double getEstimatedCost() {
+        return estimatedCost;
+    }
+
+    @Override
+    public long getEstimatedRows() {
+        return estimatedRows;
+    }
+
+    @Override
+    public void setEstimates(double estimatedCost, long estimatedRows) {
+        this.estimatedCost = estimatedCost;
+        this.estimatedRows = estimatedRows;
+    }
+
+    @Override
+    public long getActualRows() {
+        return actualRows;
+    }
+
+    @Override
+    public long getElapsedNanos() {
+        return elapsedNanos;
+    }
+
+    @Override
+    public boolean isExecuted() {
+        return executed;
+    }
+
+    @Override
     public String explain(int indent) {
         String prefix = "  ".repeat(Math.max(0, indent));
-        return prefix + "Sort(keys=" + orderBy.size() + ")\n" + child.explain(indent + 1);
+        return prefix + "Sort(keys=" + orderBy.size() + ")" + formatMetrics()
+                + "\n" + child.explain(indent + 1);
     }
 }

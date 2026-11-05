@@ -5,6 +5,7 @@ import io.nexusdb.core.catalog.IndexMetadata;
 import io.nexusdb.core.catalog.TableMetadata;
 import io.nexusdb.core.planner.BoundExpr;
 import io.nexusdb.core.planner.BoundStatement;
+import io.nexusdb.core.planner.CostBasedPlanner;
 import io.nexusdb.core.record.Column;
 import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.record.Value;
@@ -21,80 +22,17 @@ import java.util.Set;
  * equality or range predicate matches a registered B+Tree index.
  */
 public final class ExecutionPlanner {
+    private final CostBasedPlanner costBasedPlanner = new CostBasedPlanner();
 
     public ExecutionPlanner() {
     }
 
     public Executor plan(BoundStatement statement) {
-        Objects.requireNonNull(statement, "statement must not be null");
-        return switch (statement) {
-            case BoundStatement.BoundInsert insert ->
-                    new InsertExecutor(insert.table(), insert.rows());
-            case BoundStatement.BoundSelect select -> planSelect(select);
-            case BoundStatement.BoundUpdate update -> {
-                Executor scan = planTableScan(update.table(), update.where());
-                yield new UpdateExecutor(update.table(), scan, update.assignments());
-            }
-            case BoundStatement.BoundDelete delete -> {
-                Executor scan = planTableScan(delete.table(), delete.where());
-                yield new DeleteExecutor(delete.table(), scan);
-            }
-            default -> throw new IllegalArgumentException(
-                    "Statement type does not produce a physical tuple Executor directly: "
-                            + statement.getClass().getSimpleName());
-        };
-    }
-
-    private Executor planSelect(BoundStatement.BoundSelect select) {
-        Executor plan = planTableScan(select.table(), select.where());
-        if (!select.orderBy().isEmpty()) {
-            plan = new SortExecutor(plan, select.orderBy());
-        }
-        plan = new ProjectionExecutor(plan, select.projections(), select.outputSchema());
-        if (select.limit() != null) {
-            plan = new LimitExecutor(plan, select.limit());
-        }
-        return plan;
+        return costBasedPlanner.plan(statement);
     }
 
     public Executor planTableScan(TableMetadata table, BoundExpr where) {
-        if (where == null) {
-            return new SeqScanExecutor(table);
-        }
-        if (!table.getIndexes().isEmpty()) {
-            IndexCandidate best = selectBestIndexCandidate(table, where);
-            if (best != null && !preferSeqScanOnTinyTable(table, best.index())) {
-                Executor scan = new IndexScanExecutor(
-                        table,
-                        best.index(),
-                        best.lowKey(),
-                        best.lowInclusive(),
-                        best.highKey(),
-                        best.highInclusive());
-                if (best.residualPredicate() != null) {
-                    scan = new FilterExecutor(scan, best.residualPredicate());
-                }
-                return scan;
-            }
-        }
-        return new FilterExecutor(new SeqScanExecutor(table), where);
-    }
-
-    private static boolean preferSeqScanOnTinyTable(TableMetadata table, IndexMetadata index) {
-        if (!index.indexName().startsWith("pk_")) {
-            return false;
-        }
-        if (table.getTableHeap().getFirstPageId() != table.getTableHeap().getLastPageId()) {
-            return false;
-        }
-        int count = 0;
-        try (var it = table.getTableHeap().scan()) {
-            while (it.hasNext() && count < 8) {
-                it.next();
-                count++;
-            }
-        }
-        return count < 8;
+        return costBasedPlanner.planTableAccess(table, where);
     }
 
     public record IndexCandidate(

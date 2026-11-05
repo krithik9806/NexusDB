@@ -33,6 +33,8 @@ public final class TableHeap implements Iterable<Tuple> {
     private final Schema schema;
     private final int firstPageId;
     private int lastPageId;
+    private long liveRowCount;
+    private int pageCount;
     private final Object heapLock = new Object();
 
     /**
@@ -52,12 +54,12 @@ public final class TableHeap implements Iterable<Tuple> {
             firstPage.wunlatch();
             bufferPoolManager.unpinPage(firstId, true);
         }
-        return new TableHeap(bufferPoolManager, schema, firstId, firstId);
+        return new TableHeap(bufferPoolManager, schema, firstId, firstId, 0L, 1);
     }
 
     /**
      * Opens an existing {@link TableHeap} rooted at {@code firstPageId}, walking the page chain
-     * to discover {@code lastPageId}.
+     * to discover {@code lastPageId}, {@code pageCount}, and {@code liveRowCount}.
      */
     public static TableHeap open(BufferPoolManager bufferPoolManager, Schema schema, int firstPageId) {
         Objects.requireNonNull(bufferPoolManager, "bufferPoolManager must not be null");
@@ -67,26 +69,62 @@ public final class TableHeap implements Iterable<Tuple> {
         }
         int curr = firstPageId;
         int tail = firstPageId;
+        long rows = 0L;
+        int pages = 0;
         while (curr != -1) {
             tail = curr;
+            pages++;
             Page page = bufferPoolManager.fetchPage(curr);
             page.rlatch();
             try {
                 SlottedPage sp = SlottedPage.wrap(page);
+                int slotCount = sp.getSlotCount();
+                for (int slotId = 0; slotId < slotCount; slotId++) {
+                    if (sp.isValidSlot(slotId)) {
+                        rows++;
+                    }
+                }
                 curr = sp.getNextPageId();
             } finally {
                 page.runlatch();
                 bufferPoolManager.unpinPage(tail, false);
             }
         }
-        return new TableHeap(bufferPoolManager, schema, firstPageId, tail);
+        return new TableHeap(bufferPoolManager, schema, firstPageId, tail, rows, pages);
     }
 
-    private TableHeap(BufferPoolManager bufferPoolManager, Schema schema, int firstPageId, int lastPageId) {
+    /**
+     * Opens an existing {@link TableHeap} with known metadata without scanning its page chain,
+     * preserving a completely cold {@link BufferPoolManager}.
+     */
+    public static TableHeap openWithoutScan(
+            BufferPoolManager bufferPoolManager,
+            Schema schema,
+            int firstPageId,
+            int lastPageId,
+            long liveRowCount,
+            int pageCount) {
+        Objects.requireNonNull(bufferPoolManager, "bufferPoolManager must not be null");
+        Objects.requireNonNull(schema, "schema must not be null");
+        if (firstPageId <= 0 || lastPageId <= 0) {
+            throw new IllegalArgumentException("Page IDs must be > 0");
+        }
+        return new TableHeap(bufferPoolManager, schema, firstPageId, lastPageId, liveRowCount, pageCount);
+    }
+
+    private TableHeap(
+            BufferPoolManager bufferPoolManager,
+            Schema schema,
+            int firstPageId,
+            int lastPageId,
+            long liveRowCount,
+            int pageCount) {
         this.bufferPoolManager = bufferPoolManager;
         this.schema = schema;
         this.firstPageId = firstPageId;
         this.lastPageId = lastPageId;
+        this.liveRowCount = liveRowCount;
+        this.pageCount = pageCount;
     }
 
     public int getFirstPageId() {
@@ -96,6 +134,18 @@ public final class TableHeap implements Iterable<Tuple> {
     public int getLastPageId() {
         synchronized (heapLock) {
             return lastPageId;
+        }
+    }
+
+    public long getLiveRowCount() {
+        synchronized (heapLock) {
+            return liveRowCount;
+        }
+    }
+
+    public int getPageCount() {
+        synchronized (heapLock) {
+            return pageCount;
         }
     }
 
@@ -135,6 +185,7 @@ public final class TableHeap implements Iterable<Tuple> {
                 int slotId = sp.insert(bytes);
                 if (slotId >= 0) {
                     RecordId rid = new RecordId(lastPageId, slotId);
+                    liveRowCount++;
                     tailPage.wunlatch();
                     bufferPoolManager.unpinPage(lastPageId, true);
                     return rid;
@@ -178,6 +229,8 @@ public final class TableHeap implements Iterable<Tuple> {
             }
 
             this.lastPageId = newPageId;
+            this.pageCount++;
+            this.liveRowCount++;
             return new RecordId(newPageId, assignedSlot);
         }
     }
@@ -240,6 +293,7 @@ public final class TableHeap implements Iterable<Tuple> {
             if (updatedInPage) {
                 return recordId;
             }
+            liveRowCount--;
             return insert(updatedTuple);
         }
     }
@@ -264,6 +318,9 @@ public final class TableHeap implements Iterable<Tuple> {
             } finally {
                 page.wunlatch();
                 bufferPoolManager.unpinPage(pageId, deleted);
+            }
+            if (deleted) {
+                liveRowCount--;
             }
             return deleted;
         }

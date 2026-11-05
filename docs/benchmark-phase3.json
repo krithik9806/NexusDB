@@ -1,0 +1,15 @@
+{
+  "benchmark": "IndexVsSeqScanBenchmark",
+  "phase": "v0.3-index",
+  "rowCount": 1000000,
+  "seed": 42,
+  "heapPages": 10639,
+  "metrics": {
+    "seqScanColdMs": 298.7868,
+    "seqScanWarmMs": 226.8810,
+    "indexScanColdMs": 3.2006,
+    "indexScanWarmMs": 0.2065,
+    "coldSpeedup": 93.35,
+    "warmSpeedup": 1098.47
+  }
+}

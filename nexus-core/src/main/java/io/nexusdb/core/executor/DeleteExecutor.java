@@ -21,57 +21,74 @@ import java.util.Objects;
 public final class DeleteExecutor implements Executor {
     private final TableMetadata table;
     private final Executor child;
+    private boolean consumed;
+
+    private double estimatedCost;
+    private long estimatedRows;
+    private long actualRows;
+    private long elapsedNanos;
     private boolean executed;
 
     public DeleteExecutor(TableMetadata table, Executor child) {
         this.table = Objects.requireNonNull(table, "table must not be null");
         this.child = Objects.requireNonNull(child, "child must not be null");
+        this.estimatedRows = child.getEstimatedRows();
+        this.estimatedCost = child.getEstimatedCost() + this.estimatedRows * (0.8 + table.getIndexes().size() * 0.5);
     }
 
     @Override
     public void init() {
-        this.executed = false;
+        long start = System.nanoTime();
+        this.consumed = false;
+        this.actualRows = 0L;
+        this.executed = true;
         child.init();
+        this.elapsedNanos = System.nanoTime() - start;
     }
 
     @Override
     public Tuple next() {
-        if (executed) {
+        if (consumed) {
             return null;
         }
-        executed = true;
-
-        List<Tuple> targetTuples = new ArrayList<>();
+        consumed = true;
+        long start = System.nanoTime();
         try {
-            Tuple t;
-            while ((t = child.next()) != null) {
-                if (t.getRecordId() == null) {
-                    throw new IllegalStateException("Cannot delete tuple without RecordId");
+            List<Tuple> targetTuples = new ArrayList<>();
+            try {
+                Tuple t;
+                while ((t = child.next()) != null) {
+                    if (t.getRecordId() == null) {
+                        throw new IllegalStateException("Cannot delete tuple without RecordId");
+                    }
+                    targetTuples.add(t);
                 }
-                targetTuples.add(t);
+            } finally {
+                child.close();
             }
+
+            Schema schema = table.getSchema();
+            TableHeap heap = table.getTableHeap();
+            List<IndexMetadata> indexes = table.getIndexes();
+            int deletedCount = 0;
+
+            for (Tuple tuple : targetTuples) {
+                RecordId rid = tuple.getRecordId();
+                if (heap.delete(rid)) {
+                    for (IndexMetadata idx : indexes) {
+                        int colIdx = schema.getColumnIndex(idx.columnName());
+                        BPlusTree tree = table.getIndexTree(idx);
+                        tree.delete(tuple.getValue(colIdx), rid);
+                    }
+                    deletedCount++;
+                }
+            }
+
+            this.actualRows = deletedCount;
+            return new Tuple(Value.ofInt(deletedCount));
         } finally {
-            child.close();
+            elapsedNanos += System.nanoTime() - start;
         }
-
-        Schema schema = table.getSchema();
-        TableHeap heap = table.getTableHeap();
-        List<IndexMetadata> indexes = table.getIndexes();
-        int deletedCount = 0;
-
-        for (Tuple tuple : targetTuples) {
-            RecordId rid = tuple.getRecordId();
-            if (heap.delete(rid)) {
-                for (IndexMetadata idx : indexes) {
-                    int colIdx = schema.getColumnIndex(idx.columnName());
-                    BPlusTree tree = table.getIndexTree(idx);
-                    tree.delete(tuple.getValue(colIdx), rid);
-                }
-                deletedCount++;
-            }
-        }
-
-        return new Tuple(Value.ofInt(deletedCount));
     }
 
     @Override
@@ -85,8 +102,40 @@ public final class DeleteExecutor implements Executor {
     }
 
     @Override
+    public double getEstimatedCost() {
+        return estimatedCost;
+    }
+
+    @Override
+    public long getEstimatedRows() {
+        return estimatedRows;
+    }
+
+    @Override
+    public void setEstimates(double estimatedCost, long estimatedRows) {
+        this.estimatedCost = estimatedCost;
+        this.estimatedRows = estimatedRows;
+    }
+
+    @Override
+    public long getActualRows() {
+        return actualRows;
+    }
+
+    @Override
+    public long getElapsedNanos() {
+        return elapsedNanos;
+    }
+
+    @Override
+    public boolean isExecuted() {
+        return executed;
+    }
+
+    @Override
     public String explain(int indent) {
         String prefix = "  ".repeat(Math.max(0, indent));
-        return prefix + "Delete(table=" + table.getName() + ")\n" + child.explain(indent + 1);
+        return prefix + "Delete(table=" + table.getName() + ")" + formatMetrics()
+                + "\n" + child.explain(indent + 1);
     }
 }

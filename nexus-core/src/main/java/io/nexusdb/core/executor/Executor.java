@@ -3,6 +3,8 @@ package io.nexusdb.core.executor;
 import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.Tuple;
 
+import java.util.Locale;
+
 /**
  * Volcano-style pull-based physical query operator interface.
  *
@@ -35,10 +37,54 @@ public interface Executor extends AutoCloseable {
      */
     Schema getOutputSchema();
 
+    default double getEstimatedCost() {
+        return 0.0;
+    }
+
+    default long getEstimatedRows() {
+        return 0L;
+    }
+
+    default void setEstimates(double estimatedCost, long estimatedRows) {
+    }
+
+    default long getActualRows() {
+        return 0L;
+    }
+
+    default long getElapsedNanos() {
+        return 0L;
+    }
+
+    default double getElapsedTimeMs() {
+        return getElapsedNanos() / 1_000_000.0;
+    }
+
+    default boolean isExecuted() {
+        return false;
+    }
+
+    default String formatMetrics() {
+        if (isExecuted()) {
+            return String.format(
+                    Locale.US,
+                    " [cost=%.2f, rows=%d, actualRows=%d, timeMs=%.3f]",
+                    getEstimatedCost(),
+                    getEstimatedRows(),
+                    getActualRows(),
+                    getElapsedTimeMs());
+        }
+        return String.format(
+                Locale.US,
+                " [cost=%.2f, rows=%d]",
+                getEstimatedCost(),
+                getEstimatedRows());
+    }
+
     /**
      * Formats this physical operator and its children as an indented plan tree for {@code EXPLAIN}.
      */
     default String explain(int indent) {
-        return "  ".repeat(Math.max(0, indent)) + getClass().getSimpleName();
+        return "  ".repeat(Math.max(0, indent)) + getClass().getSimpleName() + formatMetrics();
     }
 }

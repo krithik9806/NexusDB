@@ -33,72 +33,86 @@ public final class InsertExecutor implements Executor {
 
     private final TableMetadata table;
     private final List<List<BoundExpr>> rows;
+    private boolean consumed;
+
+    private double estimatedCost;
+    private long estimatedRows;
+    private long actualRows;
+    private long elapsedNanos;
     private boolean executed;
 
     public InsertExecutor(TableMetadata table, List<List<BoundExpr>> rows) {
         this.table = Objects.requireNonNull(table, "table must not be null");
         this.rows = rows.stream().map(List::copyOf).toList();
+        this.estimatedRows = this.rows.size();
+        this.estimatedCost = this.rows.size() * (1.0 + table.getIndexes().size() * 0.5);
     }
 
     @Override
     public void init() {
-        this.executed = false;
+        this.consumed = false;
+        this.actualRows = 0L;
+        this.elapsedNanos = 0L;
+        this.executed = true;
     }
 
     @Override
     public Tuple next() {
-        if (executed) {
+        if (consumed) {
             return null;
         }
-        executed = true;
+        consumed = true;
+        long start = System.nanoTime();
+        try {
+            Schema schema = table.getSchema();
+            TableHeap heap = table.getTableHeap();
+            List<IndexMetadata> indexes = table.getIndexes();
+            List<Tuple> tuplesToInsert = new ArrayList<>(rows.size());
 
-        Schema schema = table.getSchema();
-        TableHeap heap = table.getTableHeap();
-        List<IndexMetadata> indexes = table.getIndexes();
-        List<Tuple> tuplesToInsert = new ArrayList<>(rows.size());
-
-        for (List<BoundExpr> rowExprs : rows) {
-            List<Value> values = new ArrayList<>(schema.getColumnCount());
-            for (int colIdx = 0; colIdx < schema.getColumnCount(); colIdx++) {
-                Column col = schema.getColumn(colIdx);
-                Value val = ExpressionEvaluator.evaluate(rowExprs.get(colIdx), null);
-                val = validateAndCoerceColumnValue(val, col);
-                values.add(val);
-            }
-            tuplesToInsert.add(new Tuple(values));
-        }
-
-        // Pre-validate all unique indexes (both intra-batch and against existing index entries)
-        // before mutating the heap so failed INSERTs leave heap and indexes completely unchanged.
-        for (IndexMetadata idx : indexes) {
-            if (!idx.unique()) {
-                continue;
-            }
-            int colIdx = schema.getColumnIndex(idx.columnName());
-            BPlusTree tree = table.getIndexTree(idx);
-            Set<Value> batchSeen = new HashSet<>();
-            for (Tuple candidate : tuplesToInsert) {
-                Value keyVal = candidate.getValue(colIdx);
-                if (!batchSeen.add(keyVal) || !tree.search(keyVal).isEmpty()) {
-                    throw new DuplicateKeyException(
-                            "Duplicate key '" + keyVal + "' violates unique index '"
-                                    + idx.indexName() + "' on column '" + idx.columnName() + "'");
+            for (List<BoundExpr> rowExprs : rows) {
+                List<Value> values = new ArrayList<>(schema.getColumnCount());
+                for (int colIdx = 0; colIdx < schema.getColumnCount(); colIdx++) {
+                    Column col = schema.getColumn(colIdx);
+                    Value val = ExpressionEvaluator.evaluate(rowExprs.get(colIdx), null);
+                    val = validateAndCoerceColumnValue(val, col);
+                    values.add(val);
                 }
+                tuplesToInsert.add(new Tuple(values));
             }
-        }
 
-        int count = 0;
-        for (Tuple tuple : tuplesToInsert) {
-            RecordId rid = heap.insert(tuple);
             for (IndexMetadata idx : indexes) {
+                if (!idx.unique()) {
+                    continue;
+                }
                 int colIdx = schema.getColumnIndex(idx.columnName());
                 BPlusTree tree = table.getIndexTree(idx);
-                tree.insert(tuple.getValue(colIdx), rid);
+                Set<Value> batchSeen = new HashSet<>();
+                for (Tuple candidate : tuplesToInsert) {
+                    Value keyVal = candidate.getValue(colIdx);
+                    if (!batchSeen.add(keyVal) || !tree.search(keyVal).isEmpty()) {
+                        throw new DuplicateKeyException(
+                                "Duplicate key '" + keyVal + "' violates unique index '"
+                                        + idx.indexName() + "' on column '" + idx.columnName() + "'");
+                    }
+                }
             }
-            count++;
-        }
 
-        return new Tuple(Value.ofInt(count));
+            int count = 0;
+            for (Tuple tuple : tuplesToInsert) {
+                RecordId rid = heap.insert(tuple);
+                for (IndexMetadata idx : indexes) {
+                    int colIdx = schema.getColumnIndex(idx.columnName());
+                    BPlusTree tree = table.getIndexTree(idx);
+                    tree.insert(tuple.getValue(colIdx), rid);
+                }
+                count++;
+            }
+
+            this.actualRows = count;
+            return new Tuple(Value.ofInt(count));
+        } finally {
+            elapsedNanos += System.nanoTime() - start;
+        }
     }
 
     static Value validateAndCoerceColumnValue(Value val, Column col) {
@@ -129,8 +143,40 @@ public final class InsertExecutor implements Executor {
     }
 
     @Override
+    public double getEstimatedCost() {
+        return estimatedCost;
+    }
+
+    @Override
+    public long getEstimatedRows() {
+        return estimatedRows;
+    }
+
+    @Override
+    public void setEstimates(double estimatedCost, long estimatedRows) {
+        this.estimatedCost = estimatedCost;
+        this.estimatedRows = estimatedRows;
+    }
+
+    @Override
+    public long getActualRows() {
+        return actualRows;
+    }
+
+    @Override
+    public long getElapsedNanos() {
+        return elapsedNanos;
+    }
+
+    @Override
+    public boolean isExecuted() {
+        return executed;
+    }
+
+    @Override
     public String explain(int indent) {
         return "  ".repeat(Math.max(0, indent))
-                + "Insert(table=" + table.getName() + ", rows=" + rows.size() + ")";
+                + "Insert(table=" + table.getName() + ", rows=" + rows.size() + ")"
+                + formatMetrics();
     }
 }

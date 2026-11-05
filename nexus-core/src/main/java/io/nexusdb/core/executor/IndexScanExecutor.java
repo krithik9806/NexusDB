@@ -27,6 +27,11 @@ public final class IndexScanExecutor implements Executor {
     private final boolean highInclusive;
 
     private Iterator<IndexEntry> rangeIterator;
+    private double estimatedCost = 1.35;
+    private long estimatedRows = 1L;
+    private long actualRows;
+    private long elapsedNanos;
+    private boolean executed;
 
     public IndexScanExecutor(
             TableMetadata table,
@@ -113,12 +118,18 @@ public final class IndexScanExecutor implements Executor {
 
     @Override
     public void init() {
-        if ((lowKey != null && lowKey.isNull()) || (highKey != null && highKey.isNull())) {
-            // Standard SQL comparisons (=, <, <=, >, >=) against NULL evaluate to UNKNOWN (0 rows)
-            this.rangeIterator = Collections.emptyIterator();
-            return;
+        long start = System.nanoTime();
+        this.actualRows = 0L;
+        this.executed = true;
+        try {
+            if ((lowKey != null && lowKey.isNull()) || (highKey != null && highKey.isNull())) {
+                this.rangeIterator = Collections.emptyIterator();
+                return;
+            }
+            this.rangeIterator = indexTree.rangeScan(lowKey, lowInclusive, highKey, highInclusive);
+        } finally {
+            this.elapsedNanos = System.nanoTime() - start;
         }
-        this.rangeIterator = indexTree.rangeScan(lowKey, lowInclusive, highKey, highInclusive);
     }
 
     @Override
@@ -126,19 +137,24 @@ public final class IndexScanExecutor implements Executor {
         if (rangeIterator == null) {
             throw new IllegalStateException("IndexScanExecutor.init() must be called before next()");
         }
-        TableHeap heap = table.getTableHeap();
-        while (rangeIterator.hasNext()) {
-            IndexEntry entry = rangeIterator.next();
-            if (entry.key().isNull()) {
-                // Skip SQL NULL keys when evaluating comparison predicates (e.g. col < literal)
-                continue;
+        long start = System.nanoTime();
+        try {
+            TableHeap heap = table.getTableHeap();
+            while (rangeIterator.hasNext()) {
+                IndexEntry entry = rangeIterator.next();
+                if (entry.key().isNull()) {
+                    continue;
+                }
+                Tuple tuple = heap.get(entry.recordId());
+                if (tuple != null) {
+                    actualRows++;
+                    return tuple;
+                }
             }
-            Tuple tuple = heap.get(entry.recordId());
-            if (tuple != null) {
-                return tuple;
-            }
+            return null;
+        } finally {
+            elapsedNanos += System.nanoTime() - start;
         }
-        return null;
     }
 
     @Override
@@ -149,6 +165,37 @@ public final class IndexScanExecutor implements Executor {
     @Override
     public Schema getOutputSchema() {
         return table.getSchema();
+    }
+
+    @Override
+    public double getEstimatedCost() {
+        return estimatedCost;
+    }
+
+    @Override
+    public long getEstimatedRows() {
+        return estimatedRows;
+    }
+
+    @Override
+    public void setEstimates(double estimatedCost, long estimatedRows) {
+        this.estimatedCost = estimatedCost;
+        this.estimatedRows = estimatedRows;
+    }
+
+    @Override
+    public long getActualRows() {
+        return actualRows;
+    }
+
+    @Override
+    public long getElapsedNanos() {
+        return elapsedNanos;
+    }
+
+    @Override
+    public boolean isExecuted() {
+        return executed;
     }
 
     public String formatPredicate() {
@@ -188,6 +235,7 @@ public final class IndexScanExecutor implements Executor {
         return "  ".repeat(Math.max(0, indent))
                 + "IndexScan(table=" + table.getName()
                 + ", index=" + index.indexName()
-                + ", predicate=" + formatPredicate() + ")";
+                + ", predicate=" + formatPredicate() + ")"
+                + formatMetrics();
     }
 }

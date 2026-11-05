@@ -208,17 +208,14 @@ public final class Database implements AutoCloseable {
 
     private String explainBoundDmlOrSelect(boolean analyze, BoundStatement inner, long startNanos) {
         try (Executor exec = executionPlanner.plan(inner)) {
-            String tree = exec.explain(0);
-            if (analyze) {
-                exec.init();
-                int count = 0;
-                while (exec.next() != null) {
-                    count++;
-                }
-                double ms = (System.nanoTime() - startNanos) / 1_000_000.0;
-                tree = tree + "\nActual rows emitted: " + count + String.format(" (%.3f ms)", ms);
+            if (!analyze) {
+                return exec.explain(0);
             }
-            return tree;
+            exec.init();
+            while (exec.next() != null) {
+                // Consume all tuples to record actualRows and timeMs at each operator node
+            }
+            return exec.explain(0);
         }
     }
 
