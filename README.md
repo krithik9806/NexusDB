@@ -6,6 +6,8 @@ NexusDB is a modular, educational, and production-inspired relational and distri
 
 - [System Architecture & Scope Tiers](docs/architecture.md)
 - [Architectural Decision Records (ADRs)](docs/design-decisions.md)
+- [Storage Engine Specification](docs/storage-engine.md)
+- [SQL Engine Specification](docs/sql-engine.md)
 
 ## Modules
 

@@ -88,3 +88,4 @@ We maintain a strict architectural and code-level separation between **Latches**
 ### Consequences
 - **Pros**: Prevents latch-lock deadlocks (threads never wait for a logical transaction lock while holding a page latch), enables high-concurrency B+Tree latch crabbing (coupling), and keeps `LockManager` completely decoupled from `BufferPoolManager` and page layouts.
 - **Cons**: Requires strict developer discipline—never perform blocking network calls or wait on `LockManager` while holding a page or B+Tree latch.
+
