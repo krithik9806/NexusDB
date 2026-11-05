@@ -48,6 +48,7 @@ java -jar nexus-client/target/nexus-client-0.1.0-SNAPSHOT.jar --db ./nexusdb-dat
 ## Known Limitations
 
 - **Current Implementation Stage**: Phases 1–2 (`v0.1-storage`, `v0.2-sql`) are complete (`DiskManager`, `PageAllocator`, `SlottedPage`, `BufferPoolManager` with `LruReplacer`, `Tuple`/`Schema`, `TableHeap`, persistent `Catalog`, SQL `Lexer`/`Parser`/`AstPrinter`, `Binder`, Volcano `Executor` pipeline with three-valued `NULL` logic, `SortExecutor`, `LimitExecutor`, `Database` facade, and `NexusCli`). B+Tree indexes, cost-based query optimization, joins/aggregations, ARIES-lite WAL recovery, Strict 2PL, and Multi-Raft are scheduled in Phases 3–7.
+- **Tree-Level B+Tree Lock (`BPlusTree`)**: Concurrent B+Tree searches and mutations are synchronized via a tree-level `ReentrantReadWriteLock` paired with per-page latches rather than fine-grained optimistic latch crabbing.
 - **In-Memory Sorting (`SortExecutor`)**: `ORDER BY` currently materializes and sorts matching rows in heap memory; external merge sort for datasets exceeding available memory is not implemented.
 - **Single-Page Tuple Size Limit**: Serialized tuples and individual catalog entries must fit within a single slotted page (`pageSize - 28` bytes; 4068 bytes for default 4 KB pages). Overflow pages for large blobs are not implemented.
 - **No Cross-Shard Distributed Transactions (ADR-004)**: ACID transactions are strictly scoped to a single shard (single Raft group). Cross-shard Two-Phase Commit (2PC) is intentionally omitted.

@@ -109,3 +109,51 @@ Each catalog entry slot contains a big-endian binary record with:
 3. `columnCount` (`4-byte int`), followed by each column's `(name, 1-byte DataType ordinal, 4-byte maxLength, 1-byte nullable, 1-byte primaryKey)`
 4. `indexCount` (`4-byte int`), followed by each index's `(indexName, columnName, 4-byte rootPageId, 1-byte unique)`
 
+---
+
+## 5. B+Tree Index Page Layout
+
+B+Tree indexes (`BPlusTree` / `BPlusTreePage` in `io.nexusdb.core.index`) store both **Leaf** (`nodeType = 1`) and **Internal** (`nodeType = 2`) nodes in `BufferPoolManager` pages using a fixed `rootPageId` (when the root splits, left and right child pages are allocated while `rootPageId` is rewritten in-place as the new internal root).
+
+### B+Tree Node Header (32 Bytes, Big-Endian)
+
+```
++-----------------------------------------------------------------------+
+| B+Tree Node Header (32 bytes)                                         |
+|  [0..7]   pageLSN           (long, 8 bytes)                           |
+|  [8]      nodeType          (byte, 1 byte: 1 = LEAF, 2 = INTERNAL)    |
+|  [9]      keyType           (byte, 1 byte: DataType ordinal)          |
+|  [10]     unique            (byte, 1 byte: 1 = unique, 0 = non-unique)|
+|  [11]     reserved          (byte, 1 byte: 0)                         |
+|  [12..13] keyCount          (short, 2 bytes: unsigned entry count m)  |
+|  [14..15] freeSpacePointer  (short, 2 bytes: start of payload area)   |
+|  [16..17] fragmentedBytes   (short, 2 bytes: dead space from deletes) |
+|  [18..19] reserved2         (short, 2 bytes: 0)                       |
+|  [20..23] prevLeafPageId    (int, 4 bytes: -1 if none / internal)     |
+|  [24..27] nextLeafPageId    (int, 4 bytes: -1 if none / internal)     |
+|  [28..31] firstChildPageId  (int, 4 bytes: child C_0 for internal)    |
++-----------------------------------------------------------------------+
+| Sorted Slot Offset Directory (starts at byte 32, 2 bytes per entry)   |
+|  Slot i at [32 + 2*i]: unsigned short offset to entry i's payload     |
++-----------------------------------------------------------------------+
+|                         <--- Free Space --->                          |
++-----------------------------------------------------------------------+
+| Entry Payload Area (grows upward from pageSize toward Slot Array)     |
++-----------------------------------------------------------------------+
+```
+
+### Entry Payload Layout
+
+- **Leaf Entry (`nodeType = 1`)**:
+  - `recordPageId` (`int`, 4 B) + `recordSlotId` (`int`, 4 B)
+  - `nullFlag` (`byte`, 1 B: `0x00` = `NULL`, `0x01` = non-null)
+  - `keyPayload` (omitted when `nullFlag == 0x00`; inline `1/4/8` B for fixed types, or `2-byte UTF-8 length + UTF-8 bytes` for `VARCHAR`)
+- **Internal Entry (`nodeType = 2`, representing separator $K_i$ and right child $C_{i+1}$)**:
+  - `rightChildPageId` (`int`, 4 B)
+  - `sepRecordPageId` (`int`, 4 B) + `sepRecordSlotId` (`int`, 4 B)
+  - `nullFlag` (`byte`, 1 B) + `keyPayload`
+- **Ordering & Concurrency**:
+  - Unique indexes order entries by `Value` key; non-unique indexes order both leaf entries and internal separators by composite `(Value key, RecordId recordId)`.
+  - Tree-level concurrency is guarded by a `ReentrantReadWriteLock` (`treeLock`) paired with per-page `rlatch()`/`wlatch()` latches, pinning at most one buffer pool page at any instant.
+
+
