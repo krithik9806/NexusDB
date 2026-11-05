@@ -1,0 +1,6 @@
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY nexus-server/target/nexus-server-*.jar /app/server.jar
+EXPOSE 9091
+ENV JAVA_OPTS="-Xms256m -Xmx512m"
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -cp /app/server.jar io.nexusdb.server.NexusNode \"$@\"", "--"]

@@ -1,4 +1,4 @@
-name: CI
+name: NexusDB CI & Release Verification
 
 on:
   push:
@@ -7,7 +7,8 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
+  unit-tests:
+    name: Unit & Engine Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -20,6 +21,77 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      - name: Run Maven Verify
-        run: mvn -B verify
+      - name: Run Core & Parser Unit Tests
+        run: mvn -B test -pl nexus-core
 
+  integration-tests:
+    name: SQL & Storage Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run SQL Integration & REPL Client Tests
+        run: mvn -B test -Dtest=*IntegrationTest,DatabaseEndToEndTest
+
+  crash-recovery:
+    name: ARIES-lite Crash Recovery Harness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Crash Recovery Iterations
+        run: mvn -B test -Dtest=CrashRecoveryHarnessTest -Pslow-tests
+
+  distributed-cluster:
+    name: Raft Consensus & Cluster Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Raft, Cluster & Sharding Tests
+        run: mvn -B test -pl nexus-distributed,nexus-server,nexus-management
+
+  studio-tests:
+    name: NexusDB Studio Frontend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: 'nexus-studio/package-lock.json'
+
+      - name: Install dependencies & Run Tests
+        working-directory: nexus-studio
+        run: |
+          npm ci
+          npm test
+          npm run build

@@ -1,0 +1,43 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Buffer Pool Cache Hit Ratio",
+      "type": "gauge",
+      "targets": [{ "expr": "nexus_cluster_cache_hit_ratio * 100", "refId": "A" }]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "id": 2,
+      "title": "Throughput (ops/sec)",
+      "type": "timeseries",
+      "targets": [{ "expr": "nexus_cluster_throughput_ops", "refId": "A" }]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "id": 3,
+      "title": "Active Transactions",
+      "type": "stat",
+      "targets": [{ "expr": "nexus_cluster_active_transactions", "refId": "A" }]
+    }
+  ],
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["nexusdb"],
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "NexusDB Cluster Telemetry",
+  "version": 1
+}

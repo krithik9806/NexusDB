@@ -1,0 +1,6 @@
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY nexus-management/target/nexus-management-*.jar /app/management.jar
+EXPOSE 8080
+ENV JAVA_OPTS="-Xms256m -Xmx512m"
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/management.jar"]

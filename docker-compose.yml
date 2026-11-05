@@ -1,62 +1,104 @@
 version: '3.8'
 
 services:
-  node-1:
+  nexus-node-1:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.node
     container_name: nexus-node-1
-    command: >
-      --node-id node-1
-      --port 9001
-      --data-dir /data
-      --peers node-2=nexus-node-2:9002,node-3=nexus-node-3:9003
+    command: ["--node-id=node-1", "--port=9091", "--data-dir=/data/n1", "--peers=node-2=nexus-node-2:9092,node-3=nexus-node-3:9093"]
     ports:
-      - "9001:9001"
+      - "9091:9091"
     volumes:
-      - nexus-node-1-data:/data
+      - n1-data:/data/n1
     networks:
       - nexus-net
 
-  node-2:
+  nexus-node-2:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.node
     container_name: nexus-node-2
-    command: >
-      --node-id node-2
-      --port 9002
-      --data-dir /data
-      --peers node-1=nexus-node-1:9001,node-3=nexus-node-3:9003
+    command: ["--node-id=node-2", "--port=9092", "--data-dir=/data/n2", "--peers=node-1=nexus-node-1:9091,node-3=nexus-node-3:9093"]
     ports:
-      - "9002:9002"
+      - "9092:9092"
     volumes:
-      - nexus-node-2-data:/data
+      - n2-data:/data/n2
     networks:
       - nexus-net
 
-  node-3:
+  nexus-node-3:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.node
     container_name: nexus-node-3
-    command: >
-      --node-id node-3
-      --port 9003
-      --data-dir /data
-      --peers node-1=nexus-node-1:9001,node-2=nexus-node-2:9002
+    command: ["--node-id=node-3", "--port=9093", "--data-dir=/data/n3", "--peers=node-1=nexus-node-1:9091,node-2=nexus-node-2:9092"]
     ports:
-      - "9003:9003"
+      - "9093:9093"
     volumes:
-      - nexus-node-3-data:/data
+      - n3-data:/data/n3
     networks:
       - nexus-net
 
-volumes:
-  nexus-node-1-data:
-  nexus-node-2-data:
-  nexus-node-3-data:
+  nexus-management:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.management
+    container_name: nexus-management
+    environment:
+      - NEXUS_CLUSTER_NODES=nexus-node-1:9091,nexus-node-2:9092,nexus-node-3:9093
+    ports:
+      - "8080:8080"
+    depends_on:
+      - nexus-node-1
+      - nexus-node-2
+      - nexus-node-3
+    networks:
+      - nexus-net
+
+  nexus-studio:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.studio
+    container_name: nexus-studio
+    ports:
+      - "3000:80"
+    depends_on:
+      - nexus-management
+    networks:
+      - nexus-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: nexus-prometheus
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - nexus-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: nexus-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - nexus-net
 
 networks:
   nexus-net:
     driver: bridge
+
+volumes:
+  n1-data:
+  n2-data:
+  n3-data:
