@@ -44,7 +44,13 @@ public final class ExecutionPlanner {
         if (select.where() != null) {
             plan = new FilterExecutor(plan, select.where());
         }
+        if (!select.orderBy().isEmpty()) {
+            plan = new SortExecutor(plan, select.orderBy());
+        }
         plan = new ProjectionExecutor(plan, select.projections(), select.outputSchema());
+        if (select.limit() != null) {
+            plan = new LimitExecutor(plan, select.limit());
+        }
         return plan;
     }
 }

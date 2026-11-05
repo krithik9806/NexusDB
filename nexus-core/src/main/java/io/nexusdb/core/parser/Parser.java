@@ -52,6 +52,40 @@ public final class Parser {
         return new Parser(tokens).parseStatement();
     }
 
+    /**
+     * Parses one or more semicolon-separated SQL statements from {@code sqlScript}.
+     */
+    public static List<Statement> parseScript(String sqlScript) {
+        Objects.requireNonNull(sqlScript, "sqlScript must not be null");
+        List<Token> tokens;
+        try {
+            tokens = Lexer.tokenize(sqlScript);
+        } catch (LexerException e) {
+            throw new ParseException(e.getMessage(), e.getLine(), e.getColumn(), e);
+        }
+        return new Parser(tokens).parseStatements();
+    }
+
+    public List<Statement> parseStatements() {
+        while (match(TokenType.SEMICOLON)) {
+            // Skip leading empty semicolons
+        }
+        if (isAtEnd()) {
+            throw error(peek(), "Expected SQL statement but found end of input");
+        }
+        List<Statement> statements = new ArrayList<>();
+        while (!isAtEnd()) {
+            statements.add(parseCoreStatement());
+            if (!isAtEnd()) {
+                consume(TokenType.SEMICOLON, "Expected ';' between SQL statements");
+                while (match(TokenType.SEMICOLON)) {
+                    // Skip consecutive semicolons
+                }
+            }
+        }
+        return List.copyOf(statements);
+    }
+
     public static Expr parseExpr(String exprSql) {
         Objects.requireNonNull(exprSql, "exprSql must not be null");
         List<Token> tokens;
