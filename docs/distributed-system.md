@@ -47,7 +47,18 @@ sequenceDiagram
 
 ---
 
-## 3. What is NOT Implemented (Known Scope Boundaries)
+## 3. Replication & Client Interaction Policy
+
+### Transaction & Write Mapping
+All write operations (DDL `CREATE TABLE`, `DROP TABLE`, and DML `INSERT`, `UPDATE`, `DELETE`) are replicated through Raft consensus prior to state machine application:
+1. **Leader Execution**: Clients send write requests to the current Raft leader. If a follower receives a write request, it responds with `NOT_LEADER: leader is <leaderId>`.
+2. **Log Proposal**: The leader packages the command string into a `RaftLogEntry` and calls `raftNode.propose(command)`.
+3. **Quorum Replication**: The leader replicates the entry via `AppendEntries` to followers.
+4. **Deterministic Apply**: Once quorum acknowledgment is received, the leader advances its `commitIndex` and applies the command to its local `Database` through `DatabaseStateMachine.apply()`. Followers apply the command in identical index order once `leaderCommit` advances.
+
+### Read Policy
+- **Leader Reads (Default)**: Consistent reads execute directly on the leader, guaranteeing that all previously committed writes are visible.
+- **Follower Reads (Stale)**: Follower reads can be served locally for read-scaling if the client permits reads up to the follower's `lastApplied` index.
 
 To keep the consensus core deterministic, inspectable, and robust, the following advanced Raft extensions are currently not implemented:
 - **Log Compaction / Snapshots (`InstallSnapshot` RPC)**: Log entries accumulate in `RaftStorage` and are retained across restarts. Snapshotting and log truncation will be evaluated in future phases.

@@ -327,12 +327,16 @@ public final class RaftNode {
     }
 
     private void onRequestVoteRequest(String fromNodeId, RaftMessage.RequestVoteRequest req) {
+        RaftMessage.RequestVoteResponse resp = handleRequestVote(fromNodeId, req);
+        transport.send(nodeId, fromNodeId, resp);
+    }
+
+    public synchronized RaftMessage.RequestVoteResponse handleRequestVote(String fromNodeId, RaftMessage.RequestVoteRequest req) {
+        if (req.term() > currentTerm) {
+            stepDownToFollower(req.term(), null);
+        }
         if (req.term() < currentTerm) {
-            transport.send(
-                    nodeId,
-                    fromNodeId,
-                    new RaftMessage.RequestVoteResponse(currentTerm, nodeId, req.term(), false));
-            return;
+            return new RaftMessage.RequestVoteResponse(currentTerm, nodeId, req.term(), false);
         }
 
         boolean canVoteForCandidate = (votedFor == null || votedFor.equals(req.candidateId()));
@@ -342,15 +346,9 @@ public final class RaftNode {
             votedFor = req.candidateId();
             storage.saveTermAndVote(currentTerm, votedFor);
             resetElectionDeadline();
-            transport.send(
-                    nodeId,
-                    fromNodeId,
-                    new RaftMessage.RequestVoteResponse(currentTerm, nodeId, req.term(), true));
+            return new RaftMessage.RequestVoteResponse(currentTerm, nodeId, req.term(), true);
         } else {
-            transport.send(
-                    nodeId,
-                    fromNodeId,
-                    new RaftMessage.RequestVoteResponse(currentTerm, nodeId, req.term(), false));
+            return new RaftMessage.RequestVoteResponse(currentTerm, nodeId, req.term(), false);
         }
     }
 
@@ -382,12 +380,16 @@ public final class RaftNode {
     }
 
     private void onAppendEntriesRequest(String fromNodeId, RaftMessage.AppendEntriesRequest req) {
+        RaftMessage.AppendEntriesResponse resp = handleAppendEntries(fromNodeId, req);
+        transport.send(nodeId, fromNodeId, resp);
+    }
+
+    public synchronized RaftMessage.AppendEntriesResponse handleAppendEntries(String fromNodeId, RaftMessage.AppendEntriesRequest req) {
+        if (req.term() > currentTerm) {
+            stepDownToFollower(req.term(), null);
+        }
         if (req.term() < currentTerm) {
-            transport.send(
-                    nodeId,
-                    fromNodeId,
-                    new RaftMessage.AppendEntriesResponse(currentTerm, nodeId, req.term(), false, 0L, 1L));
-            return;
+            return new RaftMessage.AppendEntriesResponse(currentTerm, nodeId, req.term(), false, 0L, 1L);
         }
 
         // Valid leader in currentTerm: recognize leader, step down if CANDIDATE, and reset election deadline
@@ -404,11 +406,7 @@ public final class RaftNode {
         if (prevIdx > 0L) {
             if (prevIdx > getLastLogIndex()) {
                 long conflictIdx = getLastLogIndex() + 1L;
-                transport.send(
-                        nodeId,
-                        fromNodeId,
-                        new RaftMessage.AppendEntriesResponse(currentTerm, nodeId, req.term(), false, 0L, conflictIdx));
-                return;
+                return new RaftMessage.AppendEntriesResponse(currentTerm, nodeId, req.term(), false, 0L, conflictIdx);
             }
             long localTermAtPrev = getTermAt(prevIdx);
             if (localTermAtPrev != req.prevLogTerm()) {
@@ -417,12 +415,8 @@ public final class RaftNode {
                 while (conflictIdx > 1L && getTermAt(conflictIdx - 1L) == localTermAtPrev) {
                     conflictIdx--;
                 }
-                transport.send(
-                        nodeId,
-                        fromNodeId,
-                        new RaftMessage.AppendEntriesResponse(
-                                currentTerm, nodeId, req.term(), false, 0L, Math.max(1L, conflictIdx)));
-                return;
+                return new RaftMessage.AppendEntriesResponse(
+                        currentTerm, nodeId, req.term(), false, 0L, Math.max(1L, conflictIdx));
             }
         }
 
@@ -471,10 +465,7 @@ public final class RaftNode {
         }
 
         long matched = Math.min(lastNewEntryIndex, getLastLogIndex());
-        transport.send(
-                nodeId,
-                fromNodeId,
-                new RaftMessage.AppendEntriesResponse(currentTerm, nodeId, req.term(), true, matched, matched + 1L));
+        return new RaftMessage.AppendEntriesResponse(currentTerm, nodeId, req.term(), true, matched, matched + 1L);
     }
 
     private void onAppendEntriesResponse(String fromNodeId, RaftMessage.AppendEntriesResponse resp) {

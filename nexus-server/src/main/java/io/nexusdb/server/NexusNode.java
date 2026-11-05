@@ -3,8 +3,19 @@ package io.nexusdb.server;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.nexusdb.core.engine.Database;
+import io.nexusdb.core.engine.ResultSet;
+import io.nexusdb.distributed.consensus.FileRaftStorage;
+import io.nexusdb.distributed.consensus.RaftClock;
+import io.nexusdb.distributed.consensus.RaftNode;
+import io.nexusdb.distributed.consensus.RaftRole;
+import io.nexusdb.distributed.consensus.RaftStorage;
+import io.nexusdb.distributed.consensus.RaftTimer;
+import io.nexusdb.server.raft.DatabaseStateMachine;
+import io.nexusdb.server.raft.GrpcRaftTransport;
+import io.nexusdb.server.raft.RaftServiceImpl;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -12,25 +23,32 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Main daemon process representing a single NexusDB node hosting storage and gRPC endpoints.
+ * Main daemon process representing a single NexusDB node hosting storage, Raft consensus, and gRPC endpoints.
  */
 public final class NexusNode implements AutoCloseable {
     private final String nodeId;
     private final int port;
     private final Path dataDir;
-    private final List<String> peers;
+    private final List<String> peerSpecs;
     private final Database database;
     private final Server grpcServer;
+
+    private final RaftNode raftNode;
+    private final GrpcRaftTransport raftTransport;
+    private final ScheduledExecutorService tickerExecutor;
     private volatile boolean running;
 
-    public NexusNode(String nodeId, int port, Path dataDir, List<String> peers) {
+    public NexusNode(String nodeId, int port, Path dataDir, List<String> peerSpecs) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId must not be null");
         this.port = port;
         this.dataDir = Objects.requireNonNull(dataDir, "dataDir must not be null");
-        this.peers = peers != null ? List.copyOf(peers) : Collections.emptyList();
+        this.peerSpecs = peerSpecs != null ? List.copyOf(peerSpecs) : Collections.emptyList();
 
         try {
             Files.createDirectories(dataDir);
@@ -40,31 +58,128 @@ public final class NexusNode implements AutoCloseable {
             throw new RuntimeException("Failed to initialize database directory: " + dataDir, e);
         }
 
-        SqlServiceImpl sqlService = new SqlServiceImpl(database);
+        if (!this.peerSpecs.isEmpty()) {
+            List<String> allNodeIds = new ArrayList<>();
+            allNodeIds.add(nodeId);
+
+            List<PeerInfo> peers = new ArrayList<>();
+            for (String spec : this.peerSpecs) {
+                // Format: "nodeId=host:port" or "host:port"
+                if (spec.contains("=")) {
+                    String[] parts = spec.split("=", 2);
+                    String pid = parts[0].trim();
+                    String[] hostPort = parts[1].trim().split(":", 2);
+                    peers.add(new PeerInfo(pid, hostPort[0], Integer.parseInt(hostPort[1])));
+                    allNodeIds.add(pid);
+                } else if (spec.contains(":")) {
+                    String[] hostPort = spec.trim().split(":", 2);
+                    String pid = "node-" + hostPort[1];
+                    peers.add(new PeerInfo(pid, hostPort[0], Integer.parseInt(hostPort[1])));
+                    allNodeIds.add(pid);
+                }
+            }
+
+            Collections.sort(allNodeIds);
+            RaftClock clock = System::currentTimeMillis;
+            RaftTimer timer = new RaftTimer() {
+                @Override
+                public long nextElectionTimeoutMillis(String id) {
+                    return ThreadLocalRandom.current().nextLong(150, 300);
+                }
+
+                @Override
+                public long heartbeatIntervalMillis() {
+                    return 40L;
+                }
+            };
+
+            this.raftTransport = new GrpcRaftTransport(nodeId);
+            for (PeerInfo p : peers) {
+                raftTransport.registerPeer(p.id(), p.host(), p.port());
+            }
+
+            Path raftDir = dataDir.resolve("raft");
+            RaftStorage raftStorage = new FileRaftStorage(raftDir);
+            DatabaseStateMachine stateMachine = new DatabaseStateMachine(database);
+
+            this.raftNode = new RaftNode(
+                    nodeId,
+                    allNodeIds,
+                    clock,
+                    timer,
+                    raftTransport,
+                    raftStorage,
+                    stateMachine);
+
+            this.raftTransport.setMessageHandler(delivery -> {
+                this.raftNode.handleMessage(delivery.fromNodeId(), delivery.message());
+            });
+
+            this.tickerExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "raft-ticker-" + nodeId);
+                t.setDaemon(true);
+                return t;
+            });
+        } else {
+            this.raftNode = null;
+            this.raftTransport = null;
+            this.tickerExecutor = null;
+        }
+
+        SqlServiceImpl sqlService = new SqlServiceImpl(database, raftNode);
         HealthServiceImpl healthService = new HealthServiceImpl(
                 nodeId,
-                () -> "STANDALONE",
-                () -> 0L,
-                () -> 0L,
+                () -> raftNode != null ? raftNode.getRole().name() : "STANDALONE",
+                () -> raftNode != null ? raftNode.getCurrentTerm() : 0L,
+                () -> raftNode != null ? raftNode.getCommitIndex() : 0L,
                 database);
 
-        this.grpcServer = ServerBuilder.forPort(port)
+        ServerBuilder<?> builder = ServerBuilder.forPort(port)
                 .addService(sqlService)
-                .addService(healthService)
-                .build();
+                .addService(healthService);
+
+        if (raftNode != null) {
+            builder.addService(new RaftServiceImpl(raftNode));
+        }
+
+        this.grpcServer = builder.build();
     }
+
+    private record PeerInfo(String id, String host, int port) {}
 
     public void start() throws IOException {
         grpcServer.start();
         running = true;
+
+        if (raftNode != null && tickerExecutor != null) {
+            tickerExecutor.scheduleWithFixedDelay(() -> {
+                try {
+                    raftNode.tick();
+                } catch (Throwable t) {
+                    // Suppress ticker errors to keep background thread alive
+                }
+            }, 20, 20, TimeUnit.MILLISECONDS);
+        }
     }
 
     public void stop() {
         if (running) {
             running = false;
+            if (tickerExecutor != null) {
+                tickerExecutor.shutdownNow();
+            }
+            if (raftTransport != null) {
+                raftTransport.close();
+            }
+            if (raftNode != null) {
+                try {
+                    raftNode.getStorage().close();
+                } catch (Exception ignored) {
+                }
+            }
             grpcServer.shutdown();
             try {
-                if (!grpcServer.awaitTermination(5, TimeUnit.SECONDS)) {
+                if (!grpcServer.awaitTermination(3, TimeUnit.SECONDS)) {
                     grpcServer.shutdownNow();
                 }
             } catch (InterruptedException e) {
@@ -85,6 +200,10 @@ public final class NexusNode implements AutoCloseable {
 
     public Database getDatabase() {
         return database;
+    }
+
+    public RaftNode getRaftNode() {
+        return raftNode;
     }
 
     public boolean isRunning() {
