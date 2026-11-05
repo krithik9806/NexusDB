@@ -6,6 +6,9 @@ import { DashboardView } from './components/DashboardView';
 import { SqlEditorView } from './components/SqlEditorView';
 import { ExplorerView } from './components/ExplorerView';
 import { QueryAnalyzerView } from './components/QueryAnalyzerView';
+import { ClusterMonitorView } from './components/ClusterMonitorView';
+import { PerformanceCenterView } from './components/PerformanceCenterView';
+import { FaultSimulatorView } from './components/FaultSimulatorView';
 
 const StudioMain: React.FC = () => {
   const { isAuthenticated } = useAuth();
@@ -23,9 +26,9 @@ const StudioMain: React.FC = () => {
         {activeTab === 'sql' && <SqlEditorView />}
         {activeTab === 'explorer' && <ExplorerView />}
         {activeTab === 'analyzer' && <QueryAnalyzerView />}
-        {(activeTab === 'cluster' || activeTab === 'performance' || activeTab === 'faults') && (
-          <DashboardView />
-        )}
+        {activeTab === 'cluster' && <ClusterMonitorView />}
+        {activeTab === 'performance' && <PerformanceCenterView />}
+        {activeTab === 'faults' && <FaultSimulatorView />}
       </main>
     </div>
   );
