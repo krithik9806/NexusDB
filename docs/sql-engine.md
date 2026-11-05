@@ -123,3 +123,4 @@ The following SQL features are outside the NexusDB specification and rejected at
 - Composite primary keys or multi-column indexes (`PRIMARY KEY` and `CREATE INDEX` target a single column)
 - `FOREIGN KEY` and `CHECK` constraints
 - `OFFSET`, `FETCH FIRST`, `DISTINCT`, `LIKE`, `BETWEEN`, `CASE WHEN`
+

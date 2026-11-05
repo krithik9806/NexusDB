@@ -107,3 +107,4 @@ Each catalog entry is serialized as a record containing:
 2. `firstHeapPageId` (`INT`)
 3. `columnCount` (`INT`), followed by each column's `(name, DataType, maxLength, nullable, primaryKey)`
 4. `indexCount` (`INT`), followed by each index's `(indexName, columnName, rootPageId, unique)`
+

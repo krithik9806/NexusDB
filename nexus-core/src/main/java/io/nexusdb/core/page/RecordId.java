@@ -16,3 +16,4 @@ public record RecordId(int pageId, int slotId) implements Comparable<RecordId> {
         return cmp != 0 ? cmp : Integer.compare(this.slotId, other.slotId);
     }
 }
+
