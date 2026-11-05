@@ -75,6 +75,21 @@ The `AdminService` gRPC endpoint enables dynamic fault simulation:
 - `ADD_LATENCY`: Injects artificial network delay into inter-node transport.
 - `CLEAR_FAULTS`: Resets all active simulated faults.
 
+---
+
+## 5. Multi-Raft Sharding & Scatter-Gather Routing
+
+### Multi-Raft Architecture
+NexusDB partitions data across independent **Multi-Raft shards**:
+- Each table is partitioned using either a `HASH` or `RANGE` strategy on a designated shard key column (e.g. `PRIMARY KEY`).
+- Every shard constitutes an independent Raft consensus group (with 3 replica nodes).
+- A single physical node hosts multiple Raft groups simultaneously, driving independent `StateMachine` instances backed by isolated database files or namespaces.
+
+### Query Routing Policy (ADR-004)
+- **Point Queries & Single-Key Writes**: Inspected by `ShardRouter` for the partition key (`WHERE id = ?` or `INSERT INTO ... VALUES (key, ...)`). Routed directly to the owning shard's Raft leader.
+- **Scatter-Gather Reads**: Non-keyed `SELECT` queries broadcast to all shards. The coordinator merges partial result sets, applying in-memory `ORDER BY`, `LIMIT`, and aggregate accumulation (`COUNT`, `SUM`, `MIN`, `MAX`).
+- **No Cross-Shard Transactions**: Multi-shard writes or multi-shard transactions (`BEGIN ... COMMIT`) spanning multiple shards are explicitly rejected with `UnsupportedCrossShardOperationException`. All ACID guarantees remain strictly local to a single shard.
+
 To keep the consensus core deterministic, inspectable, and robust, the following advanced Raft extensions are currently not implemented:
 - **Log Compaction / Snapshots (`InstallSnapshot` RPC)**: Log entries accumulate in `RaftStorage` and are retained across restarts. Snapshotting and log truncation will be evaluated in future phases.
 - **Dynamic Membership Changes (Joint Consensus / Single-Server Transitions)**: Cluster membership is statically configured at startup via node IDs and peer lists. Adding or removing nodes dynamically requires cluster restart.
