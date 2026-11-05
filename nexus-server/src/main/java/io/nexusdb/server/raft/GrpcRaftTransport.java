@@ -97,7 +97,7 @@ public final class GrpcRaftTransport implements RaftTransport, AutoCloseable {
                             .setLastLogTerm(req.lastLogTerm())
                             .build();
 
-                    RequestVoteReply reply = stub.withDeadlineAfter(500, TimeUnit.MILLISECONDS).requestVote(args);
+                    RequestVoteReply reply = stub.withDeadlineAfter(2000, TimeUnit.MILLISECONDS).requestVote(args);
                     deliverLocal(toNodeId, new RaftMessage.RequestVoteResponse(
                             reply.getTerm(),
                             reply.getVoterId(),
@@ -122,7 +122,7 @@ public final class GrpcRaftTransport implements RaftTransport, AutoCloseable {
                             .addAllEntries(protoEntries)
                             .build();
 
-                    AppendEntriesReply reply = stub.withDeadlineAfter(500, TimeUnit.MILLISECONDS).appendEntries(args);
+                    AppendEntriesReply reply = stub.withDeadlineAfter(2000, TimeUnit.MILLISECONDS).appendEntries(args);
                     deliverLocal(toNodeId, new RaftMessage.AppendEntriesResponse(
                             reply.getTerm(),
                             reply.getNodeId(),

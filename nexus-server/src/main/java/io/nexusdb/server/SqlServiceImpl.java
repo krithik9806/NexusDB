@@ -56,7 +56,7 @@ public final class SqlServiceImpl extends SqlServiceGrpc.SqlServiceImplBase {
 
                 // Propose write to Raft consensus group
                 byte[] command = sql.getBytes(StandardCharsets.UTF_8);
-                byte[] result = raftNode.propose(command).get(10, TimeUnit.SECONDS);
+                byte[] result = raftNode.propose(command).get(15, TimeUnit.SECONDS);
                 String resStr = new String(result, StandardCharsets.UTF_8);
 
                 if (resStr.startsWith("ERROR:")) {
