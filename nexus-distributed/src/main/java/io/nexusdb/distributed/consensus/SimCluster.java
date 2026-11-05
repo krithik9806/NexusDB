@@ -8,12 +8,14 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Deterministic in-memory cluster simulator driving a group of {@link RaftNode}s with
- * a shared {@link SimClock}, seeded {@link RaftTimer}, and fault-injectable {@link SimTransport}.
+ * a shared {@link SimClock}, seeded {@link RaftTimer}, fault-injectable {@link SimTransport},
+ * and per-node {@link RaftStorage} and {@link StateMachine} instances.
  */
-public final class SimCluster {
+public final class SimCluster implements AutoCloseable {
     public static final long DEFAULT_MIN_ELECTION_TIMEOUT_MS = 150L;
     public static final long DEFAULT_MAX_ELECTION_TIMEOUT_MS = 300L;
     public static final long DEFAULT_HEARTBEAT_INTERVAL_MS = 40L;
@@ -22,6 +24,8 @@ public final class SimCluster {
     private final SimClock clock;
     private final RaftTimer timer;
     private final SimTransport transport;
+    private final Map<String, RaftStorage> storages = new LinkedHashMap<>();
+    private final Function<String, StateMachine> stateMachineFactory;
     private final Map<String, RaftNode> nodes = new LinkedHashMap<>();
     private final Map<Long, String> electedLeaderByTerm = new LinkedHashMap<>();
 
@@ -31,7 +35,24 @@ public final class SimCluster {
                 seed,
                 DEFAULT_MIN_ELECTION_TIMEOUT_MS,
                 DEFAULT_MAX_ELECTION_TIMEOUT_MS,
-                DEFAULT_HEARTBEAT_INTERVAL_MS);
+                DEFAULT_HEARTBEAT_INTERVAL_MS,
+                id -> new InMemoryRaftStorage(),
+                id -> StateMachine.noop());
+    }
+
+    public SimCluster(
+            List<String> nodeIds,
+            long seed,
+            Function<String, RaftStorage> storageFactory,
+            Function<String, StateMachine> stateMachineFactory) {
+        this(
+                nodeIds,
+                seed,
+                DEFAULT_MIN_ELECTION_TIMEOUT_MS,
+                DEFAULT_MAX_ELECTION_TIMEOUT_MS,
+                DEFAULT_HEARTBEAT_INTERVAL_MS,
+                storageFactory,
+                stateMachineFactory);
     }
 
     public SimCluster(
@@ -40,7 +61,27 @@ public final class SimCluster {
             long minElectionTimeoutMs,
             long maxElectionTimeoutMs,
             long heartbeatIntervalMs) {
+        this(
+                nodeIds,
+                seed,
+                minElectionTimeoutMs,
+                maxElectionTimeoutMs,
+                heartbeatIntervalMs,
+                id -> new InMemoryRaftStorage(),
+                id -> StateMachine.noop());
+    }
+
+    public SimCluster(
+            List<String> nodeIds,
+            long seed,
+            long minElectionTimeoutMs,
+            long maxElectionTimeoutMs,
+            long heartbeatIntervalMs,
+            Function<String, RaftStorage> storageFactory,
+            Function<String, StateMachine> stateMachineFactory) {
         Objects.requireNonNull(nodeIds, "nodeIds must not be null");
+        Objects.requireNonNull(storageFactory, "storageFactory must not be null");
+        Objects.requireNonNull(stateMachineFactory, "stateMachineFactory must not be null");
         if (nodeIds.isEmpty()) {
             throw new IllegalArgumentException("nodeIds must not be empty");
         }
@@ -63,9 +104,13 @@ public final class SimCluster {
             }
         };
         this.transport = new SimTransport(clock, seed);
+        this.stateMachineFactory = stateMachineFactory;
 
         for (String id : this.nodeIds) {
-            nodes.put(id, new RaftNode(id, this.nodeIds, clock, timer, transport));
+            RaftStorage storage = storageFactory.apply(id);
+            storages.put(id, storage);
+            StateMachine sm = stateMachineFactory.apply(id);
+            nodes.put(id, new RaftNode(id, this.nodeIds, clock, timer, transport, storage, sm));
         }
     }
 
@@ -93,6 +138,10 @@ public final class SimCluster {
         return n;
     }
 
+    public RaftStorage getStorage(String nodeId) {
+        return storages.get(nodeId);
+    }
+
     public List<RaftNode> getNodes() {
         return List.copyOf(nodes.values());
     }
@@ -112,9 +161,19 @@ public final class SimCluster {
         transport.markNodeCrashed(nodeId);
     }
 
-    public void restartNode(String nodeId) {
+    /**
+     * Simulates a full node restart by reconstructing the {@link RaftNode} from its durable
+     * {@link RaftStorage} and a fresh {@link StateMachine} (with volatile {@code commitIndex = 0}
+     * and {@code lastApplied = 0}).
+     */
+    public RaftNode restartNode(String nodeId) {
         getNode(nodeId);
+        RaftStorage storage = storages.get(nodeId);
+        StateMachine freshSm = stateMachineFactory.apply(nodeId);
+        RaftNode reloaded = new RaftNode(nodeId, nodeIds, clock, timer, transport, storage, freshSm);
+        nodes.put(nodeId, reloaded);
         transport.markNodeRecovered(nodeId);
+        return reloaded;
     }
 
     public void partition(Set<String> sideA, Set<String> sideB) {
@@ -225,5 +284,15 @@ public final class SimCluster {
 
     public Map<Long, String> getElectedLeaderByTerm() {
         return Collections.unmodifiableMap(electedLeaderByTerm);
+    }
+
+    @Override
+    public void close() {
+        for (RaftStorage storage : storages.values()) {
+            try {
+                storage.close();
+            } catch (RuntimeException ignored) {
+            }
+        }
     }
 }
