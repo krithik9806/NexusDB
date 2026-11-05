@@ -26,7 +26,8 @@ mvn -q verify
 
 ## Known Limitations
 
-- **Current Implementation Stage**: The repository is currently at the monorepo bootstrap and architectural specification stage; core storage, WAL, B+Tree, and Raft components are scheduled across Tiers 1–3.
+- **Current Implementation Stage**: Phase 1 (`v0.1-storage`) is complete (`DiskManager`, `PageAllocator`, `SlottedPage`, `BufferPoolManager` with `LruReplacer`, `Tuple`/`Schema`, `TableHeap`, and persistent `Catalog`). WAL recovery, B+Tree indexes, Strict 2PL, SQL execution, and Multi-Raft are scheduled in Phases 2–7.
+- **Single-Page Tuple Size Limit**: Serialized tuples and individual catalog entries must fit within a single slotted page (`pageSize - 28` bytes; 4068 bytes for default 4 KB pages). Overflow pages for large blobs are not implemented.
 - **No Cross-Shard Distributed Transactions (ADR-004)**: ACID transactions are strictly scoped to a single shard (single Raft group). Cross-shard Two-Phase Commit (2PC) is intentionally omitted.
 - **Strict 2PL Concurrency Control (ADR-002)**: Readers acquire shared locks (`S`) and writers acquire exclusive locks (`X`) held until transaction completion; readers and writers on the same key/tuple can block one another until MVCC is introduced.
 - **Dual Logging in Replicated Mode (ADR-003)**: Each shard replica logs consensus commands in the Raft log (`nexus-distributed`) and applies committed entries to `nexus-core`, which maintains its own local WAL and buffer pool.

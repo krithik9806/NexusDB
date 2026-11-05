@@ -101,11 +101,11 @@ Data pages (heap pages and catalog pages) use a **Slotted Page** organization so
 
 ## 4. Persistent Catalog Layout
 
-The system catalog stores table schemas, heap starting pages, and index metadata in a dedicated `TableHeap` rooted at `catalogMetaPageId` (recorded in Page 0, typically Page 1).
+The system catalog stores table schemas, heap starting pages, and index metadata in a dedicated doubly-linked chain of system `SlottedPage`s rooted at `catalogMetaPageId` (recorded in Page 0, typically Page 1).
 
-Each catalog entry is serialized as a record containing:
-1. `tableName` (`VARCHAR`)
-2. `firstHeapPageId` (`INT`)
-3. `columnCount` (`INT`), followed by each column's `(name, DataType, maxLength, nullable, primaryKey)`
-4. `indexCount` (`INT`), followed by each index's `(indexName, columnName, rootPageId, unique)`
+Each catalog entry slot contains a big-endian binary record with:
+1. `tableName` (`2-byte UTF-8 length + UTF-8 bytes`)
+2. `firstHeapPageId` (`4-byte int`)
+3. `columnCount` (`4-byte int`), followed by each column's `(name, 1-byte DataType ordinal, 4-byte maxLength, 1-byte nullable, 1-byte primaryKey)`
+4. `indexCount` (`4-byte int`), followed by each index's `(indexName, columnName, 4-byte rootPageId, 1-byte unique)`
 
