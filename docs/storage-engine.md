@@ -158,4 +158,46 @@ B+Tree indexes (`BPlusTree` / `BPlusTreePage` in `io.nexusdb.core.index`) store 
   - Range scans (`BPlusTree.rangeScan`) descend to the lower-bound leaf and walk `nextLeafPageId` links one page at a time without holding page pins across caller iterations.
   - Tree-level concurrency is guarded by a `ReentrantReadWriteLock` (`treeLock`) paired with per-page `rlatch()`/`wlatch()` latches, pinning at most one buffer pool page at any instant.
 
+---
+
+## 6. Write-Ahead Log (WAL) Binary Record Format
+
+The Write-Ahead Log (`LogManager`, `LogRecord`, `LogReader` in `io.nexusdb.core.wal`) stores sequential, big-endian log records framed with a 12-byte header and a 32-bit CRC32 checksum.
+
+### WAL Record Header & Envelope
+
+```
++-----------------------------------------------------------------------+
+| WAL Record Header (12 bytes, Big-Endian)                              |
+|  [0..3]   magic          (int, 4 B: 0x57414C52 = "WALR")              |
+|  [4..7]   payloadLength  (int, 4 B: byte length of payload)           |
+|  [8..11]  crc32          (int, 4 B: CRC32 over [magic+len+payload])   |
++-----------------------------------------------------------------------+
+| Common Payload Prefix (25 bytes, Big-Endian)                          |
+|  [12..19] lsn            (long, 8 B: monotonically increasing >= 1)   |
+|  [20..27] txnId          (long, 8 B: transaction ID, 0 for ckpt)      |
+|  [28..35] prevLsn        (long, 8 B: previous LSN of txn, or 0)       |
+|  [36]     recordType     (byte, 1 B: LogRecordType ordinal)           |
++-----------------------------------------------------------------------+
+| Type-Specific Payload (variable length)                               |
++-----------------------------------------------------------------------+
+```
+
+### Record Types (`LogRecordType`) & Type-Specific Payloads
+
+| Ordinal | Type | Type-Specific Payload Layout |
+| :--- | :--- | :--- |
+| `0` | `BEGIN` | *(empty)* |
+| `1` | `COMMIT` | *(empty)* |
+| `2` | `ABORT` | *(empty)* |
+| `3` | `UPDATE` | `tableName` (`2B UTF-8 len + bytes`), `pageId` (`int`), `slotId` (`int`; `-1` for full-page image), `beforeImageLen` (`int`) + `beforeImage`, `afterImageLen` (`int`) + `afterImage` |
+| `4` | `INSERT` | `tableName` (`2B UTF-8 len + bytes`), `pageId` (`int`), `slotId` (`int`), `afterImageLen` (`int`) + `afterImage` |
+| `5` | `DELETE` | `tableName` (`2B UTF-8 len + bytes`), `pageId` (`int`), `slotId` (`int`), `beforeImageLen` (`int`) + `beforeImage` |
+| `6` | `CLR` | `tableName` (`2B UTF-8 len + bytes`), `pageId` (`int`), `slotId` (`int`), `undoNextLsn` (`long`), `afterImageLen` (`int`) + `afterImage` |
+| `7` | `CHECKPOINT_BEGIN` | *(empty)* |
+| `8` | `CHECKPOINT_END` | `dptSize` (`int`) + `dptSize * (pageId: int, recLsn: long)` + `attSize` (`int`) + `attSize * (txnId: long, lastLsn: long)` |
+
+- **Torn-Write & Corrupt-Tail Handling**: `LogReader` validates `magic == 0x57414C52`, `payloadLength` bounds, file remaining bytes, and `CRC32` over `[magic + payloadLength + payload]`. If a crash leaves a partial or corrupted record at the tail of the WAL file, `LogReader` stops cleanly at the last valid record boundary (`validEndOffset`) and truncates the trailing bytes when opened in recovery/repair mode.
+
+
 
