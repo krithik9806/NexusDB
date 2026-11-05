@@ -237,7 +237,7 @@ public final class RaftNode {
      * If this node is not currently {@link RaftRole#LEADER} or steps down/loses its entry before commit,
      * the future completes exceptionally with {@link IllegalStateException}.
      */
-    public CompletableFuture<byte[]> propose(byte[] command) {
+    public synchronized CompletableFuture<byte[]> propose(byte[] command) {
         Objects.requireNonNull(command, "command must not be null");
         if (role != RaftRole.LEADER) {
             return CompletableFuture.failedFuture(
@@ -264,7 +264,7 @@ public final class RaftNode {
     /**
      * Advances the state machine according to the current {@link RaftClock#nowMillis()}.
      */
-    public void tick() {
+    public synchronized void tick() {
         long now = clock.nowMillis();
         if (role == RaftRole.LEADER) {
             if (now >= nextHeartbeatMillis) {
@@ -310,7 +310,7 @@ public final class RaftNode {
     /**
      * Processes an incoming {@link RaftMessage} from {@code fromNodeId}.
      */
-    public void handleMessage(String fromNodeId, RaftMessage message) {
+    public synchronized void handleMessage(String fromNodeId, RaftMessage message) {
         Objects.requireNonNull(fromNodeId, "fromNodeId must not be null");
         Objects.requireNonNull(message, "message must not be null");
 
