@@ -255,6 +255,20 @@ On `Database.open(path)`, `RecoveryManager` automatically executes 3-pass ARIES-
 4. **Achieved Isolation Level & Phantom Read Limitations**:
    - Holding row-level `SHARED` and `EXCLUSIVE` locks until transaction completion prevents **dirty writes**, **dirty reads**, **non-repeatable reads**, and **lost updates** (**Repeatable Read** semantics on existing rows, and **Serializable** for point-key lookups/inserts on unique indexes).
    - **Phantom Read Limitation**: Because range predicates (`WHERE balance BETWEEN 100 AND 500`) lock existing matching `RecordId`s rather than acquiring next-key / predicate range locks across B+Tree gaps, a concurrent transaction inserting a new row into that range can produce a phantom row if the first transaction re-executes the range query before committing.
+5. **Latch & Pin-Ordering Audit (`BufferPoolManager`, `TableHeap`, `BPlusTree`)**:
+   - **Global 6-Tier Lock/Latch Hierarchy**: Every thread in `nexus-core` acquires locks and latches strictly in the following acyclic top-down order:
+     1. `Database.ddlLock` (`ReentrantReadWriteLock`: read lock for DML/SELECT/transactions, write lock for DDL/checkpoints)
+     2. `LockManager` logical transaction locks (`lockTableMutex`: table, unique-key, and row `RecordId` locks)
+     3. Structure mutex (`TableHeap.heapLock` / `BPlusTree.treeLock` / `Catalog.catalogLock`)
+     4. `BufferPoolManager.poolLock`
+     5. Per-page reader/writer latch (`Page.rlatch()` / `Page.wlatch()`)
+     6. `LogManager` WAL buffer/flush locks (`bufferLock` / `flushLock`)
+   - **Single-Page Pin Discipline**: `TableHeap`, `TableIterator`, `BPlusTree`, `BPlusTreeRangeIterator`, and `Catalog` pin at most **one** buffer pool frame at any instant, unlatching (`runlatch`/`wunlatch`) and unpinning (`unpinPage`) the current page before fetching or allocating any sibling, child, or overflow page. This guarantees that even a 1-frame buffer pool never suffers pin starvation or coupled-pin deadlocks.
+   - **Audit Fix 1 — Eliminating `Page.latch <-> poolLock` Inversion**: `BufferPoolManager.dirtyPageTable` uses a `ConcurrentHashMap<Integer, Long>` so `recordPageModification(page, lsn)` (invoked while holding `page.wlatch()`) updates `pageLSN` and `dirtyPageTable` without acquiring `poolLock`. Conversely, `BufferPoolManager.writeBackLocked(frame)` (invoked under `poolLock`) acquires `page.rlatch()` before reading `page.getPageLsn()` and `page.getData()`, preventing concurrent flushes from observing half-mutated pages or inverting latch acquisition order.
+   - **Audit Fix 2 — Atomic Unique-Key Index Lookup & In-Place Update Maintenance**: `IndexScanExecutor` acquires the transaction's `SHARED` or `EXCLUSIVE` lock on `LockId.key(tableName, indexName, key)` before probing a unique `BPlusTree`, and `UpdateExecutor` / `TransactionManager` skip `BPlusTree.delete` + `BPlusTree.insert` when neither the indexed column value nor the tuple's `RecordId` changed, eliminating transient index-entry disappearance windows under concurrent `SELECT` + `UPDATE` workloads.
+6. **Transaction Observability (`TransactionMetrics`)**:
+   - `TransactionManager.getMetrics()` and `Database.getTransactionMetrics()` return an immutable `TransactionMetrics(activeTransactions, lockWaits, deadlockCount, committedCount, abortedCount)` snapshot for monitoring and Studio telemetry.
+
 
 
 

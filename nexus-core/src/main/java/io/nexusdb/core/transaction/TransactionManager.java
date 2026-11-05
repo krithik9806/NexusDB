@@ -332,16 +332,20 @@ public final class TransactionManager implements AutoCloseable {
                 if (tableMeta != null) {
                     for (IndexMetadata idx : tableMeta.getIndexes()) {
                         int colIdx = tableMeta.getSchema().getColumnIndex(idx.columnName());
-                        BPlusTree tree = tableMeta.getIndexTree(idx);
-                        tree.delete(newTuple.getValue(colIdx), rid);
-                        tree.insert(oldTuple.getValue(colIdx), rid);
+                        if (!oldTuple.getValue(colIdx).equals(newTuple.getValue(colIdx))) {
+                            BPlusTree tree = tableMeta.getIndexTree(idx);
+                            tree.delete(newTuple.getValue(colIdx), rid);
+                            tree.insert(oldTuple.getValue(colIdx), rid);
+                        }
                     }
                 } else {
                     List<StandaloneIndexBinding> bindings = standaloneIndexes.get(tableName.toLowerCase(Locale.ROOT));
                     if (bindings != null) {
                         for (StandaloneIndexBinding b : bindings) {
-                            b.indexTree().delete(newTuple.getValue(b.columnIndex()), rid);
-                            b.indexTree().insert(oldTuple.getValue(b.columnIndex()), rid);
+                            if (!oldTuple.getValue(b.columnIndex()).equals(newTuple.getValue(b.columnIndex()))) {
+                                b.indexTree().delete(newTuple.getValue(b.columnIndex()), rid);
+                                b.indexTree().insert(oldTuple.getValue(b.columnIndex()), rid);
+                            }
                         }
                     }
                 }
@@ -381,6 +385,18 @@ public final class TransactionManager implements AutoCloseable {
 
     public long getAbortedCount() {
         return abortedCount.get();
+    }
+
+    /**
+     * Returns an immutable snapshot of transaction and concurrency-control metrics.
+     */
+    public TransactionMetrics getMetrics() {
+        return new TransactionMetrics(
+                activeTransactions.size(),
+                lockManager.getTotalLockWaits(),
+                lockManager.getDeadlockCount(),
+                committedCount.get(),
+                abortedCount.get());
     }
 
     public LogManager getLogManager() {

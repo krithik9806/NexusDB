@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongConsumer;
 
@@ -82,7 +83,7 @@ public final class BufferPoolManager implements AutoCloseable {
         this.frames = new Frame[poolSize];
         this.freeFrames = new ArrayDeque<>(poolSize);
         this.pageTable = new HashMap<>(poolSize * 2);
-        this.dirtyPageTable = new LinkedHashMap<>(poolSize * 2);
+        this.dirtyPageTable = new ConcurrentHashMap<>(poolSize * 2);
 
         for (int i = 0; i < poolSize; i++) {
             frames[i] = new Frame();
@@ -117,19 +118,16 @@ public final class BufferPoolManager implements AutoCloseable {
     /**
      * Stamps {@code page.setPageLsn(lsn)} and records {@code lsn} in the Dirty Page Table
      * as {@code recLsn} if the page was not already dirty since its last flush.
+     *
+     * <p>Latch-Ordering Invariant: This method is invoked while the caller holds {@code page.wlatch()}
+     * and therefore MUST NOT acquire {@code poolLock} (which precedes page latches in the global
+     * lock hierarchy {@code poolLock -> Page.latch}).
      */
     public void recordPageModification(Page page, long lsn) {
         Objects.requireNonNull(page, "page must not be null");
         page.setPageLsn(lsn);
         if (lsn > 0) {
-            synchronized (poolLock) {
-                int pageId = page.getPageId();
-                Integer frameId = pageTable.get(pageId);
-                if (frameId != null) {
-                    frames[frameId].dirty = true;
-                }
-                dirtyPageTable.putIfAbsent(pageId, lsn);
-            }
+            dirtyPageTable.putIfAbsent(page.getPageId(), lsn);
         }
     }
 
@@ -271,7 +269,7 @@ public final class BufferPoolManager implements AutoCloseable {
     public void flushAll() {
         synchronized (poolLock) {
             for (Frame frame : frames) {
-                if (frame.page != null && frame.dirty) {
+                if (frame.page != null && (frame.dirty || dirtyPageTable.containsKey(frame.page.getPageId()))) {
                     writeBackLocked(frame);
                 }
             }
@@ -316,7 +314,7 @@ public final class BufferPoolManager implements AutoCloseable {
                     "Buffer pool exhausted: all " + poolSize + " frames are currently pinned");
         }
         Frame victim = frames[victimFrameId];
-        if (victim.dirty) {
+        if (victim.dirty || dirtyPageTable.containsKey(victim.page.getPageId())) {
             writeBackLocked(victim);
         }
         pageTable.remove(victim.page.getPageId());
@@ -328,21 +326,26 @@ public final class BufferPoolManager implements AutoCloseable {
 
     private void writeBackLocked(Frame frame) {
         Page page = frame.page;
-        long pageLsn = page.getPageLsn();
-        LongConsumer hook = this.walFlushHook;
-        if (hook != null && pageLsn > 0) {
-            hook.accept(pageLsn);
+        page.rlatch();
+        try {
+            long pageLsn = page.getPageLsn();
+            LongConsumer hook = this.walFlushHook;
+            if (hook != null && pageLsn > 0) {
+                hook.accept(pageLsn);
+            }
+            LogManager lm = this.logManager;
+            if (lm != null && pageLsn > 0 && lm.getFlushedLsn() < pageLsn) {
+                throw new IllegalStateException(
+                        "Write-Ahead Logging protocol violation: cannot write dirty page " + page.getPageId()
+                                + " (pageLSN=" + pageLsn + ") before WAL is flushed (flushedLSN="
+                                + lm.getFlushedLsn() + ")");
+            }
+            diskManager.writePage(page.getPageId(), page.getData());
+            frame.dirty = false;
+            dirtyPageTable.remove(page.getPageId());
+        } finally {
+            page.runlatch();
         }
-        LogManager lm = this.logManager;
-        if (lm != null && pageLsn > 0 && lm.getFlushedLsn() < pageLsn) {
-            throw new IllegalStateException(
-                    "Write-Ahead Logging protocol violation: cannot write dirty page " + page.getPageId()
-                            + " (pageLSN=" + pageLsn + ") before WAL is flushed (flushedLSN="
-                            + lm.getFlushedLsn() + ")");
-        }
-        diskManager.writePage(page.getPageId(), page.getData());
-        frame.dirty = false;
-        dirtyPageTable.remove(page.getPageId());
     }
 
     public int getPoolSize() {
@@ -367,7 +370,7 @@ public final class BufferPoolManager implements AutoCloseable {
     public boolean isDirty(int pageId) {
         synchronized (poolLock) {
             Integer frameId = pageTable.get(pageId);
-            return frameId != null && frames[frameId].dirty;
+            return frameId != null && (frames[frameId].dirty || dirtyPageTable.containsKey(pageId));
         }
     }
 

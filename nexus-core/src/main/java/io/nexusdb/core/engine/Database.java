@@ -18,6 +18,7 @@ import io.nexusdb.core.transaction.DeadlockException;
 import io.nexusdb.core.transaction.LockManager;
 import io.nexusdb.core.transaction.Transaction;
 import io.nexusdb.core.transaction.TransactionManager;
+import io.nexusdb.core.transaction.TransactionMetrics;
 import io.nexusdb.core.transaction.TransactionState;
 import io.nexusdb.core.wal.CheckpointManager;
 import io.nexusdb.core.wal.LogManager;
@@ -536,6 +537,10 @@ public final class Database implements AutoCloseable {
 
     public LockManager getLockManager() {
         return transactionManager.getLockManager();
+    }
+
+    public TransactionMetrics getTransactionMetrics() {
+        return transactionManager.getMetrics();
     }
 
     public RecoveryManager getRecoveryManager() {

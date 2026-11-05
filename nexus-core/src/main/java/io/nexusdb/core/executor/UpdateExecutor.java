@@ -217,21 +217,18 @@ public final class UpdateExecutor implements Executor {
 
             for (int i = 0; i < targets.size(); i++) {
                 Tuple oldTuple = targets.get(i);
-                RecordId oldRid = oldTuple.getRecordId();
-                for (IndexMetadata idx : indexes) {
-                    int colIdx = schema.getColumnIndex(idx.columnName());
-                    BPlusTree tree = table.getIndexTree(idx);
-                    tree.delete(oldTuple.getValue(colIdx), oldRid);
-                }
-            }
-
-            for (int i = 0; i < targets.size(); i++) {
                 Tuple updatedTuple = newTuples.get(i);
+                RecordId oldRid = oldTuple.getRecordId();
                 RecordId newRid = updatedRids.get(i);
                 for (IndexMetadata idx : indexes) {
                     int colIdx = schema.getColumnIndex(idx.columnName());
-                    BPlusTree tree = table.getIndexTree(idx);
-                    tree.insert(updatedTuple.getValue(colIdx), newRid);
+                    Value oldKey = oldTuple.getValue(colIdx);
+                    Value newKey = updatedTuple.getValue(colIdx);
+                    if (!oldKey.equals(newKey) || !oldRid.equals(newRid)) {
+                        BPlusTree tree = table.getIndexTree(idx);
+                        tree.delete(oldKey, oldRid);
+                        tree.insert(newKey, newRid);
+                    }
                 }
             }
 

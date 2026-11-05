@@ -140,6 +140,17 @@ public final class IndexScanExecutor implements Executor {
                 this.rangeIterator = Collections.emptyIterator();
                 return;
             }
+            if (isEqualityLookup() && index.unique()) {
+                LogManager lm = table.getTableHeap().getBufferPoolManager().getLogManager();
+                if (lm != null
+                        && lm.getThreadTransactionContext() instanceof Transaction txn
+                        && txn.getLockManager() != null) {
+                    txn.getLockManager().acquire(
+                            txn,
+                            LockId.key(table.getName(), index.indexName(), lowKey),
+                            lockMode);
+                }
+            }
             this.rangeIterator = indexTree.rangeScan(lowKey, lowInclusive, highKey, highInclusive);
         } finally {
             this.elapsedNanos = System.nanoTime() - start;
