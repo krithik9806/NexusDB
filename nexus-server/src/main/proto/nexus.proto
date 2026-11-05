@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package io.nexusdb.proto;
+
+option java_multiple_files = true;
+option java_package = "io.nexusdb.proto";
+option java_outer_classname = "NexusProto";
+
+// --- SQL Service ---
+
+service SqlService {
+  rpc Execute (SqlRequest) returns (SqlResponse);
+}
+
+message SqlRequest {
+  string sql = 1;
+  string session_id = 2;
+}
+
+message SqlRow {
+  repeated string values = 1;
+}
+
+message SqlResponse {
+  bool success = 1;
+  string error_message = 2;
+  repeated string columns = 3;
+  repeated SqlRow rows = 4;
+  int32 rows_affected = 5;
+  double execution_time_ms = 6;
+}
+
+// --- Raft Consensus Service ---
+
+service RaftService {
+  rpc RequestVote (RequestVoteArgs) returns (RequestVoteReply);
+  rpc AppendEntries (AppendEntriesArgs) returns (AppendEntriesReply);
+}
+
+message RequestVoteArgs {
+  string candidate_id = 1;
+  int64 term = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message RequestVoteReply {
+  string voter_id = 1;
+  int64 term = 2;
+  bool vote_granted = 3;
+}
+
+message LogEntryProto {
+  int64 index = 1;
+  int64 term = 2;
+  bytes command = 3;
+}
+
+message AppendEntriesArgs {
+  string leader_id = 1;
+  int64 term = 2;
+  int64 prev_log_index = 3;
+  int64 prev_log_term = 4;
+  repeated LogEntryProto entries = 5;
+  int64 leader_commit_index = 6;
+}
+
+message AppendEntriesReply {
+  string node_id = 1;
+  int64 term = 2;
+  bool success = 3;
+  int64 match_index = 4;
+  int64 conflict_index = 5;
+  int64 conflict_term = 6;
+}
+
+// --- Node Health & Metrics Service ---
+
+service HealthService {
+  rpc Check (HealthRequest) returns (NodeHealthResponse);
+}
+
+message HealthRequest {
+  string client_id = 1;
+}
+
+message NodeHealthResponse {
+  string node_id = 1;
+  string role = 2;
+  int64 uptime_ms = 3;
+  double cache_hit_ratio = 4;
+  int32 active_transactions = 5;
+  int64 current_term = 6;
+  int64 commit_index = 7;
+}

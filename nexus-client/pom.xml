@@ -18,6 +18,10 @@
             <groupId>io.nexusdb</groupId>
             <artifactId>nexus-core</artifactId>
         </dependency>
+        <dependency>
+            <groupId>io.nexusdb</groupId>
+            <artifactId>nexus-server</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

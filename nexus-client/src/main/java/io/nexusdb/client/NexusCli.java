@@ -9,6 +9,8 @@ import io.nexusdb.core.planner.BindException;
 import io.nexusdb.core.record.Column;
 import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.storage.StorageException;
+import io.nexusdb.proto.SqlResponse;
+import io.nexusdb.proto.SqlRow;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -27,12 +29,17 @@ import java.util.stream.Collectors;
 
 /**
  * NexusDB interactive SQL REPL and non-interactive script runner.
+ * Supports both local embedded databases and remote connections over gRPC.
  */
 public final class NexusCli {
     private static final String PROMPT = "nexusdb> ";
     private static final String CONTINUATION_PROMPT = "      -> ";
 
     private final List<String> history = new ArrayList<>();
+
+    public List<String> getHistory() {
+        return Collections.unmodifiableList(history);
+    }
 
     public static void main(String[] args) {
         int code = new NexusCli().run(args, System.in, System.out, System.err);
@@ -49,6 +56,9 @@ public final class NexusCli {
 
         Path dbPath = Path.of("nexusdb-data");
         Path scriptFile = null;
+        String host = null;
+        int port = 9000;
+        boolean tls = false;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -67,10 +77,45 @@ public final class NexusCli {
                     }
                     scriptFile = Path.of(args[++i]);
                 }
+                case "--host", "-h" -> {
+                    if (i + 1 >= args.length) {
+                        err.println("Error: Missing host argument for " + arg);
+                        return 1;
+                    }
+                    host = args[++i];
+                }
+                case "--port", "-p" -> {
+                    if (i + 1 >= args.length) {
+                        err.println("Error: Missing port argument for " + arg);
+                        return 1;
+                    }
+                    port = Integer.parseInt(args[++i]);
+                }
+                case "--tls" -> {
+                    tls = true;
+                }
                 default -> {
-                    err.println("Error: Unknown option '" + arg + "'. Usage: NexusCli [--db <path>] [--file <path>]");
+                    err.println("Error: Unknown option '" + arg + "'. Usage: NexusCli [--db <path>] [--host <host>] [--port <port>] [--tls] [--file <path>]");
                     return 1;
                 }
+            }
+        }
+
+        if (host != null) {
+            try (NexusClient client = new NexusClient(host, port, tls)) {
+                if (scriptFile != null) {
+                    if (!Files.exists(scriptFile)) {
+                        err.println("Error: SQL script file does not exist: " + scriptFile);
+                        return 1;
+                    }
+                    String scriptContent = Files.readString(scriptFile, StandardCharsets.UTF_8);
+                    return executeRemoteScript(client, scriptContent, out, err);
+                }
+                runRemoteRepl(client, in, out, err);
+                return 0;
+            } catch (Exception e) {
+                err.println("Remote connection error: " + e.getMessage());
+                return 1;
             }
         }
 
@@ -89,6 +134,124 @@ public final class NexusCli {
             err.println("Error: " + e.getMessage());
             return 1;
         }
+    }
+
+    private int executeRemoteScript(NexusClient client, String scriptContent, PrintStream out, PrintStream err) {
+        String[] stmts = scriptContent.split(";");
+        for (String raw : stmts) {
+            String sql = raw.trim();
+            if (sql.isEmpty()) {
+                continue;
+            }
+            SqlResponse resp = client.execute(sql);
+            if (!resp.getSuccess()) {
+                err.println("Error: " + resp.getErrorMessage());
+                return 1;
+            }
+            printSqlResponse(resp, out);
+        }
+        return 0;
+    }
+
+    private void runRemoteRepl(NexusClient client, InputStream in, PrintStream out, PrintStream err) throws IOException {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+        StringBuilder statementBuffer = new StringBuilder();
+
+        while (true) {
+            out.print(statementBuffer.isEmpty() ? PROMPT : CONTINUATION_PROMPT);
+            out.flush();
+
+            String line = reader.readLine();
+            if (line == null) {
+                break;
+            }
+
+            String trimmed = line.trim();
+            if (statementBuffer.isEmpty()) {
+                if (trimmed.isEmpty() || trimmed.startsWith("--")) {
+                    continue;
+                }
+                if (trimmed.equalsIgnoreCase(".quit") || trimmed.equalsIgnoreCase(".exit")) {
+                    break;
+                }
+            }
+
+            if (!statementBuffer.isEmpty()) {
+                statementBuffer.append('\n');
+            }
+            statementBuffer.append(line);
+
+            if (hasTerminatingSemicolon(statementBuffer)) {
+                String fullSql = statementBuffer.toString().trim();
+                statementBuffer.setLength(0);
+                history.add(fullSql);
+                try {
+                    SqlResponse resp = client.execute(fullSql);
+                    if (!resp.getSuccess()) {
+                        err.println("Error: " + resp.getErrorMessage());
+                    } else {
+                        printSqlResponse(resp, out);
+                    }
+                } catch (Exception e) {
+                    err.println("gRPC error: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private static void printSqlResponse(SqlResponse resp, PrintStream out) {
+        if (resp.getColumnsCount() == 0) {
+            out.println("Query OK, " + resp.getRowsAffected() + " rows affected (" + String.format(Locale.ROOT, "%.2f", resp.getExecutionTimeMs()) + " ms)");
+            return;
+        }
+
+        List<String> cols = resp.getColumnsList();
+        List<List<String>> rows = new ArrayList<>();
+        for (SqlRow r : resp.getRowsList()) {
+            rows.add(r.getValuesList());
+        }
+
+        int[] widths = new int[cols.size()];
+        for (int i = 0; i < cols.size(); i++) {
+            widths[i] = cols.get(i).length();
+        }
+        for (List<String> r : rows) {
+            for (int i = 0; i < cols.size(); i++) {
+                String v = i < r.size() ? r.get(i) : "NULL";
+                widths[i] = Math.max(widths[i], v.length());
+            }
+        }
+
+        StringBuilder sep = new StringBuilder("+");
+        for (int w : widths) {
+            sep.append("-".repeat(w + 2)).append("+");
+        }
+        out.println(sep);
+
+        StringBuilder header = new StringBuilder("|");
+        for (int i = 0; i < cols.size(); i++) {
+            header.append(" ").append(padRight(cols.get(i), widths[i])).append(" |");
+        }
+        out.println(header);
+        out.println(sep);
+
+        for (List<String> r : rows) {
+            StringBuilder row = new StringBuilder("|");
+            for (int i = 0; i < cols.size(); i++) {
+                String v = i < r.size() ? r.get(i) : "NULL";
+                row.append(" ").append(padRight(v, widths[i])).append(" |");
+            }
+            out.println(row);
+        }
+        out.println(sep);
+        out.println(rows.size() + " row" + (rows.size() == 1 ? "" : "s") + " in set (" + String.format(Locale.ROOT, "%.2f", resp.getExecutionTimeMs()) + " ms)");
+    }
+
+    private static String padRight(String s, int width) {
+        if (s.length() >= width) {
+            return s;
+        }
+        return s + " ".repeat(width - s.length());
     }
 
     private int executeBatch(Database db, String scriptContent, PrintStream out, PrintStream err) {
@@ -254,23 +417,19 @@ public final class NexusCli {
         }
     }
 
-    /**
-     * Checks whether {@code buffer} contains an unquoted, uncommented semicolon followed only
-     * by whitespace or comments.
-     */
-    static boolean hasTerminatingSemicolon(CharSequence buffer) {
-        boolean inSingleQuote = false;
-        boolean inLineComment = false;
+    private static boolean hasTerminatingSemicolon(CharSequence buffer) {
+        boolean inSingleQuotes = false;
         boolean inBlockComment = false;
-        boolean seenTopLevelSemicolon = false;
-        int len = buffer.length();
+        boolean inLineComment = false;
+        char lastSignificantChar = '\0';
 
+        int len = buffer.length();
         for (int i = 0; i < len; i++) {
             char c = buffer.charAt(i);
             char next = (i + 1 < len) ? buffer.charAt(i + 1) : '\0';
 
             if (inLineComment) {
-                if (c == '\n') {
+                if (c == '\n' || c == '\r') {
                     inLineComment = false;
                 }
                 continue;
@@ -282,14 +441,12 @@ public final class NexusCli {
                 }
                 continue;
             }
-            if (inSingleQuote) {
-                if (c == '\\' && i + 1 < len) {
-                    i++;
-                } else if (c == '\'') {
+            if (inSingleQuotes) {
+                if (c == '\'') {
                     if (next == '\'') {
-                        i++;
+                        i++; // escaped quote
                     } else {
-                        inSingleQuote = false;
+                        inSingleQuotes = false;
                     }
                 }
                 continue;
@@ -306,20 +463,15 @@ public final class NexusCli {
                 continue;
             }
             if (c == '\'') {
-                inSingleQuote = true;
-                seenTopLevelSemicolon = false;
+                inSingleQuotes = true;
                 continue;
             }
-            if (c == ';') {
-                seenTopLevelSemicolon = true;
-            } else if (!Character.isWhitespace(c)) {
-                seenTopLevelSemicolon = false;
+
+            if (!Character.isWhitespace(c)) {
+                lastSignificantChar = c;
             }
         }
-        return seenTopLevelSemicolon;
-    }
 
-    public List<String> getHistory() {
-        return Collections.unmodifiableList(history);
+        return !inSingleQuotes && !inBlockComment && lastSignificantChar == ';';
     }
 }
