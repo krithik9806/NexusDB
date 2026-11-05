@@ -237,6 +237,26 @@ On `Database.open(path)`, `RecoveryManager` automatically executes 3-pass ARIES-
    - For each undone tuple modification (`INSERT`, `DELETE`, `UPDATE`), appends a `CLR` record with `undoNextLsn = record.prevLsn()` and stamps `page.setPageLsn(clrLsn)`. If recovery encounters a `CLR` written by an earlier interrupted recovery attempt, it never undoes the `CLR` and instead jumps directly to `CLR.undoNextLsn`, making crash recovery strictly idempotent across repeated crashes during recovery.
    - Once a loser transaction reaches its `BEGIN` record (`prevLsn == 0`), an `ABORT` record is appended. Finally, `Catalog.reload()` and `TableMetadata.rebuildIndexesFromHeap()` synchronize all primary and secondary B+Tree indexes with the recovered table heaps.
 
+---
+
+## 7. Concurrency Control, Strict 2PL & Isolation Guarantees
+
+`LockManager` (`io.nexusdb.core.transaction`) enforces **Strict Two-Phase Locking (Strict 2PL)**:
+
+1. **Lock Modes & Granularities (`LockMode`, `LockId`)**:
+   - `SHARED` (`S`) and `EXCLUSIVE` (`X`) locks over `TABLE`, physical `ROW` (`RecordId`), and logical unique-index `KEY` (`(tableName, indexName, keyValue)`) resources.
+   - `SELECT` operators (`SeqScanExecutor`, `FilterExecutor`, `IndexScanExecutor`) acquire `SHARED` locks on matching rows before reading; `INSERT`, `UPDATE`, and `DELETE` operators acquire `EXCLUSIVE` locks on affected rows and unique index keys.
+   - All `SHARED` and `EXCLUSIVE` locks are held until `TransactionManager.commit(txn)` or `TransactionManager.rollback(txn)` completes.
+2. **Lock Upgrades & FIFO Fairness**:
+   - A transaction holding `SHARED` on a resource that requests `EXCLUSIVE` upgrades in-place immediately if it is the sole `SHARED` holder, or is queued ahead of non-upgrade waiters on that resource.
+   - New lock arrivals cannot bypass queued waiters in a resource's FIFO queue, preventing writer starvation.
+3. **Waits-For Graph Deadlock Detection**:
+   - A background daemon thread (`nexusdb-deadlock-detector`) and on-demand cycle check construct the directed waits-for graph ($T_{\text{waiter}} \to T_{\text{blocker}}$) and abort the **youngest transaction** ($\max(\text{txnId})$) in any cycle with `DeadlockException`, automatically rolling back the victim transaction's uncommitted modifications and releasing its locks.
+4. **Achieved Isolation Level & Phantom Read Limitations**:
+   - Holding row-level `SHARED` and `EXCLUSIVE` locks until transaction completion prevents **dirty writes**, **dirty reads**, **non-repeatable reads**, and **lost updates** (**Repeatable Read** semantics on existing rows, and **Serializable** for point-key lookups/inserts on unique indexes).
+   - **Phantom Read Limitation**: Because range predicates (`WHERE balance BETWEEN 100 AND 500`) lock existing matching `RecordId`s rather than acquiring next-key / predicate range locks across B+Tree gaps, a concurrent transaction inserting a new row into that range can produce a phantom row if the first transaction re-executes the range query before committing.
+
+
 
 
 

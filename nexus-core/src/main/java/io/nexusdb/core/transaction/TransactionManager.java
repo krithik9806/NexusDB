@@ -38,10 +38,11 @@ import java.util.concurrent.atomic.AtomicLong;
  *       the terminal {@code ABORT} log record.</li>
  * </ul>
  */
-public final class TransactionManager {
+public final class TransactionManager implements AutoCloseable {
     private static final byte[] EMPTY_BYTES = new byte[0];
 
     private final LogManager logManager;
+    private final LockManager lockManager;
     private volatile Catalog catalog;
     private final AtomicLong nextTxnId = new AtomicLong(1L);
     private final Map<Long, Transaction> activeTransactions = new ConcurrentHashMap<>();
@@ -57,16 +58,25 @@ public final class TransactionManager {
     }
 
     public TransactionManager(LogManager logManager, Catalog catalog) {
+        this(logManager, catalog, new LockManager());
+    }
+
+    public TransactionManager(LogManager logManager, Catalog catalog, LockManager lockManager) {
         this.logManager = Objects.requireNonNull(logManager, "logManager must not be null");
         this.catalog = catalog;
+        this.lockManager = Objects.requireNonNull(lockManager, "lockManager must not be null");
     }
 
     public TransactionManager(LogManager logManager) {
-        this(logManager, null);
+        this(logManager, null, new LockManager());
     }
 
     public void setCatalog(Catalog catalog) {
         this.catalog = catalog;
+    }
+
+    public LockManager getLockManager() {
+        return lockManager;
     }
 
     /**
@@ -97,10 +107,36 @@ public final class TransactionManager {
     public Transaction begin(boolean autoCommit) {
         long txnId = nextTxnId.getAndIncrement();
         long beginLsn = logManager.appendBegin(txnId);
-        Transaction txn = new Transaction(txnId, beginLsn, autoCommit);
+        Transaction txn = new Transaction(txnId, beginLsn, autoCommit, lockManager);
         activeTransactions.put(txnId, txn);
         logManager.setThreadTransactionContext(txn);
         return txn;
+    }
+
+    /**
+     * Starts a lightweight read-only transaction for autocommit {@code SELECT} statements so
+     * readers acquire and release Strict 2PL {@link LockMode#SHARED} locks without writing
+     * {@code BEGIN}/{@code COMMIT} records to the WAL.
+     */
+    public Transaction beginReadOnly() {
+        long txnId = nextTxnId.getAndIncrement();
+        Transaction txn = new Transaction(txnId, 0L, true, lockManager);
+        logManager.setThreadTransactionContext(txn);
+        return txn;
+    }
+
+    public void endReadOnly(Transaction txn) {
+        if (txn == null) {
+            return;
+        }
+        try {
+            txn.setState(TransactionState.COMMITTED);
+        } finally {
+            lockManager.releaseAll(txn);
+            if (logManager.getThreadTransactionContext() == txn) {
+                logManager.clearThreadTransactionContext();
+            }
+        }
     }
 
     /**
@@ -137,6 +173,7 @@ public final class TransactionManager {
                 committedCount.incrementAndGet();
             } finally {
                 activeTransactions.remove(txn.getTxnId());
+                lockManager.releaseAll(txn);
                 if (logManager.getThreadTransactionContext() == txn) {
                     logManager.clearThreadTransactionContext();
                 }
@@ -169,6 +206,7 @@ public final class TransactionManager {
                 abortedCount.incrementAndGet();
             } finally {
                 activeTransactions.remove(txn.getTxnId());
+                lockManager.releaseAll(txn);
                 if (previousCtx != null && previousCtx != txn) {
                     logManager.setThreadTransactionContext(previousCtx);
                 } else {
@@ -347,5 +385,10 @@ public final class TransactionManager {
 
     public LogManager getLogManager() {
         return logManager;
+    }
+
+    @Override
+    public void close() {
+        lockManager.close();
     }
 }

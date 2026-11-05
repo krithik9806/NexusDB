@@ -11,6 +11,10 @@ import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
+import io.nexusdb.core.transaction.LockId;
+import io.nexusdb.core.transaction.LockManager;
+import io.nexusdb.core.transaction.LockMode;
+import io.nexusdb.core.transaction.Transaction;
 import io.nexusdb.core.wal.LogManager;
 
 import java.util.ArrayList;
@@ -43,8 +47,19 @@ public final class UpdateExecutor implements Executor {
         this.table = Objects.requireNonNull(table, "table must not be null");
         this.child = Objects.requireNonNull(child, "child must not be null");
         this.assignments = List.copyOf(Objects.requireNonNull(assignments, "assignments must not be null"));
+        configureExclusiveScanLockMode(this.child);
         this.estimatedRows = child.getEstimatedRows();
         this.estimatedCost = child.getEstimatedCost() + this.estimatedRows * (1.0 + table.getIndexes().size() * 0.5);
+    }
+
+    static void configureExclusiveScanLockMode(Executor exec) {
+        if (exec instanceof SeqScanExecutor seqScan) {
+            seqScan.setLockMode(LockMode.EXCLUSIVE);
+        } else if (exec instanceof IndexScanExecutor indexScan) {
+            indexScan.setLockMode(LockMode.EXCLUSIVE);
+        } else if (exec instanceof FilterExecutor filter) {
+            filter.setLockMode(LockMode.EXCLUSIVE);
+        }
     }
 
     @Override
@@ -83,11 +98,26 @@ public final class UpdateExecutor implements Executor {
             Schema schema = table.getSchema();
             TableHeap heap = table.getTableHeap();
             List<IndexMetadata> indexes = table.getIndexes();
+            LogManager lm = heap.getBufferPoolManager().getLogManager();
+            Transaction txn = (lm != null && lm.getThreadTransactionContext() instanceof Transaction t) ? t : null;
+            LockManager lockMgr = txn != null ? txn.getLockManager() : null;
+            boolean managedByTxn = lm != null && lm.getThreadTransactionContext() != null;
 
+            List<Tuple> lockedTargets = new ArrayList<>(targets.size());
             List<Tuple> newTuples = new ArrayList<>(targets.size());
             Set<RecordId> targetRidSet = new HashSet<>(targets.size() * 2);
 
-            for (Tuple existing : targets) {
+            for (Tuple candidate : targets) {
+                RecordId rid = candidate.getRecordId();
+                Tuple existing = candidate;
+                if (lockMgr != null && rid != null) {
+                    lockMgr.acquire(txn, LockId.row(table.getName(), rid), LockMode.EXCLUSIVE);
+                    existing = heap.get(rid);
+                    if (existing == null) {
+                        continue;
+                    }
+                }
+                lockedTargets.add(existing);
                 targetRidSet.add(existing.getRecordId());
                 List<Value> newValues = new ArrayList<>(existing.getValues());
                 for (BoundStatement.BoundAssignment assignment : assignments) {
@@ -97,11 +127,30 @@ public final class UpdateExecutor implements Executor {
                     Value validated = InsertExecutor.validateAndCoerceColumnValue(evaluated, col);
                     newValues.set(colIdx, validated);
                 }
-                newTuples.add(new Tuple(newValues, existing.getRecordId()));
+                Tuple updated = new Tuple(newValues, existing.getRecordId());
+                if (lockMgr != null) {
+                    for (IndexMetadata idx : indexes) {
+                        if (idx.unique()) {
+                            int colIdx = schema.getColumnIndex(idx.columnName());
+                            lockMgr.acquire(
+                                    txn,
+                                    LockId.key(table.getName(), idx.indexName(), existing.getValue(colIdx)),
+                                    LockMode.EXCLUSIVE);
+                            lockMgr.acquire(
+                                    txn,
+                                    LockId.key(table.getName(), idx.indexName(), updated.getValue(colIdx)),
+                                    LockMode.EXCLUSIVE);
+                        }
+                    }
+                }
+                newTuples.add(updated);
             }
 
-            LogManager lm = heap.getBufferPoolManager().getLogManager();
-            boolean managedByTxn = lm != null && lm.getThreadTransactionContext() != null;
+            targets = lockedTargets;
+            if (targets.isEmpty()) {
+                this.actualRows = 0L;
+                return new Tuple(Value.ofInt(0));
+            }
 
             if (!managedByTxn) {
                 for (IndexMetadata idx : indexes) {
@@ -135,6 +184,9 @@ public final class UpdateExecutor implements Executor {
                 Tuple oldTuple = targets.get(i);
                 Tuple updatedTuple = newTuples.get(i);
                 RecordId newRid = heap.update(oldTuple.getRecordId(), updatedTuple);
+                if (lockMgr != null && !newRid.equals(oldTuple.getRecordId())) {
+                    lockMgr.acquire(txn, LockId.row(table.getName(), newRid), LockMode.EXCLUSIVE);
+                }
                 updatedRids.add(newRid);
 
                 if (managedByTxn) {

@@ -5,6 +5,10 @@ import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.TableIterator;
 import io.nexusdb.core.record.Tuple;
+import io.nexusdb.core.transaction.LockId;
+import io.nexusdb.core.transaction.LockMode;
+import io.nexusdb.core.transaction.Transaction;
+import io.nexusdb.core.wal.LogManager;
 
 import java.util.Objects;
 
@@ -15,6 +19,8 @@ public final class SeqScanExecutor implements Executor {
     private final String tableName;
     private final TableHeap tableHeap;
     private TableIterator iterator;
+    private boolean deferRowLockToFilter;
+    private LockMode lockMode = LockMode.SHARED;
 
     private double estimatedCost;
     private long estimatedRows;
@@ -37,6 +43,26 @@ public final class SeqScanExecutor implements Executor {
         this.estimatedCost = tableHeap.getPageCount() * 1.0 + this.estimatedRows * 0.10;
     }
 
+    public String getTableName() {
+        return tableName;
+    }
+
+    public TableHeap getTableHeap() {
+        return tableHeap;
+    }
+
+    public void setDeferRowLockToFilter(boolean deferRowLockToFilter) {
+        this.deferRowLockToFilter = deferRowLockToFilter;
+    }
+
+    public LockMode getLockMode() {
+        return lockMode;
+    }
+
+    public void setLockMode(LockMode lockMode) {
+        this.lockMode = Objects.requireNonNull(lockMode, "lockMode must not be null");
+    }
+
     @Override
     public void init() {
         long start = System.nanoTime();
@@ -56,14 +82,31 @@ public final class SeqScanExecutor implements Executor {
         }
         long start = System.nanoTime();
         try {
-            if (!iterator.hasNext()) {
-                return null;
-            }
-            Tuple tuple = iterator.next();
-            if (tuple != null) {
+            while (iterator.hasNext()) {
+                Tuple tuple = iterator.next();
+                if (tuple == null) {
+                    continue;
+                }
+                if (!deferRowLockToFilter && tuple.getRecordId() != null) {
+                    LogManager lm = tableHeap.getBufferPoolManager().getLogManager();
+                    if (lm != null
+                            && lm.getThreadTransactionContext() instanceof Transaction txn
+                            && txn.getLockManager() != null) {
+                        txn.getLockManager().acquire(
+                                txn,
+                                LockId.row(tableName, tuple.getRecordId()),
+                                lockMode);
+                        Tuple fresh = tableHeap.get(tuple.getRecordId());
+                        if (fresh == null) {
+                            continue;
+                        }
+                        tuple = fresh;
+                    }
+                }
                 actualRows++;
+                return tuple;
             }
-            return tuple;
+            return null;
         } finally {
             elapsedNanos += System.nanoTime() - start;
         }

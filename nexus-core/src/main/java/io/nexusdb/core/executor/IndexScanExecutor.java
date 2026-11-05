@@ -8,6 +8,11 @@ import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
+import io.nexusdb.core.transaction.LockId;
+import io.nexusdb.core.transaction.LockManager;
+import io.nexusdb.core.transaction.LockMode;
+import io.nexusdb.core.transaction.Transaction;
+import io.nexusdb.core.wal.LogManager;
 
 import java.util.Collections;
 import java.util.Iterator;
@@ -27,6 +32,7 @@ public final class IndexScanExecutor implements Executor {
     private final boolean highInclusive;
 
     private Iterator<IndexEntry> rangeIterator;
+    private LockMode lockMode = LockMode.SHARED;
     private double estimatedCost = 1.35;
     private long estimatedRows = 1L;
     private long actualRows;
@@ -106,6 +112,14 @@ public final class IndexScanExecutor implements Executor {
         return highInclusive;
     }
 
+    public LockMode getLockMode() {
+        return lockMode;
+    }
+
+    public void setLockMode(LockMode lockMode) {
+        this.lockMode = Objects.requireNonNull(lockMode, "lockMode must not be null");
+    }
+
     public boolean isEqualityLookup() {
         return lowKey != null
                 && highKey != null
@@ -140,13 +154,21 @@ public final class IndexScanExecutor implements Executor {
         long start = System.nanoTime();
         try {
             TableHeap heap = table.getTableHeap();
+            LogManager lm = heap.getBufferPoolManager().getLogManager();
+            Transaction txn = (lm != null && lm.getThreadTransactionContext() instanceof Transaction t) ? t : null;
+            LockManager lockMgr = txn != null ? txn.getLockManager() : null;
+            int colIdx = table.getSchema().getColumnIndex(index.columnName());
+
             while (rangeIterator.hasNext()) {
                 IndexEntry entry = rangeIterator.next();
                 if (entry.key().isNull()) {
                     continue;
                 }
+                if (lockMgr != null) {
+                    lockMgr.acquire(txn, LockId.row(table.getName(), entry.recordId()), lockMode);
+                }
                 Tuple tuple = heap.get(entry.recordId());
-                if (tuple != null) {
+                if (tuple != null && matchesBounds(tuple.getValue(colIdx))) {
                     actualRows++;
                     return tuple;
                 }
@@ -155,6 +177,25 @@ public final class IndexScanExecutor implements Executor {
         } finally {
             elapsedNanos += System.nanoTime() - start;
         }
+    }
+
+    private boolean matchesBounds(Value val) {
+        if (val == null || val.isNull()) {
+            return false;
+        }
+        if (lowKey != null && !lowKey.isNull()) {
+            int cmp = val.compareTo(lowKey);
+            if (lowInclusive ? cmp < 0 : cmp <= 0) {
+                return false;
+            }
+        }
+        if (highKey != null && !highKey.isNull()) {
+            int cmp = val.compareTo(highKey);
+            if (highInclusive ? cmp > 0 : cmp >= 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override

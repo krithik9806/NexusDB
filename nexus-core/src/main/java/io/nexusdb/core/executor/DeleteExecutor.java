@@ -8,6 +8,11 @@ import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
+import io.nexusdb.core.transaction.LockId;
+import io.nexusdb.core.transaction.LockManager;
+import io.nexusdb.core.transaction.LockMode;
+import io.nexusdb.core.transaction.Transaction;
+import io.nexusdb.core.wal.LogManager;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -32,6 +37,7 @@ public final class DeleteExecutor implements Executor {
     public DeleteExecutor(TableMetadata table, Executor child) {
         this.table = Objects.requireNonNull(table, "table must not be null");
         this.child = Objects.requireNonNull(child, "child must not be null");
+        UpdateExecutor.configureExclusiveScanLockMode(this.child);
         this.estimatedRows = child.getEstimatedRows();
         this.estimatedCost = child.getEstimatedCost() + this.estimatedRows * (0.8 + table.getIndexes().size() * 0.5);
     }
@@ -70,10 +76,25 @@ public final class DeleteExecutor implements Executor {
             Schema schema = table.getSchema();
             TableHeap heap = table.getTableHeap();
             List<IndexMetadata> indexes = table.getIndexes();
+            LogManager lm = heap.getBufferPoolManager().getLogManager();
+            Transaction txn = (lm != null && lm.getThreadTransactionContext() instanceof Transaction t) ? t : null;
+            LockManager lockMgr = txn != null ? txn.getLockManager() : null;
             int deletedCount = 0;
 
             for (Tuple tuple : targetTuples) {
                 RecordId rid = tuple.getRecordId();
+                if (lockMgr != null) {
+                    lockMgr.acquire(txn, LockId.row(table.getName(), rid), LockMode.EXCLUSIVE);
+                    for (IndexMetadata idx : indexes) {
+                        if (idx.unique()) {
+                            int colIdx = schema.getColumnIndex(idx.columnName());
+                            lockMgr.acquire(
+                                    txn,
+                                    LockId.key(table.getName(), idx.indexName(), tuple.getValue(colIdx)),
+                                    LockMode.EXCLUSIVE);
+                        }
+                    }
+                }
                 if (heap.delete(rid)) {
                     for (IndexMetadata idx : indexes) {
                         int colIdx = schema.getColumnIndex(idx.columnName());

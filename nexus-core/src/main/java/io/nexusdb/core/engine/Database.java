@@ -14,6 +14,8 @@ import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
 import io.nexusdb.core.recovery.RecoveryManager;
 import io.nexusdb.core.storage.DiskManager;
+import io.nexusdb.core.transaction.DeadlockException;
+import io.nexusdb.core.transaction.LockManager;
 import io.nexusdb.core.transaction.Transaction;
 import io.nexusdb.core.transaction.TransactionManager;
 import io.nexusdb.core.transaction.TransactionState;
@@ -26,6 +28,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Embedded relational database facade wiring {@link DiskManager}, {@link LogManager},
@@ -60,7 +63,7 @@ public final class Database implements AutoCloseable {
     private final RecoveryManager.RecoveryReport lastRecoveryReport;
     private final Binder binder;
     private final ExecutionPlanner executionPlanner;
-    private final Object executionLock = new Object();
+    private final ReentrantReadWriteLock ddlLock = new ReentrantReadWriteLock();
     private final ThreadLocal<Transaction> explicitThreadTxn = new ThreadLocal<>();
     private volatile boolean closed;
 
@@ -189,21 +192,44 @@ public final class Database implements AutoCloseable {
      */
     public List<ResultSet> executeScript(String sqlScript) {
         Objects.requireNonNull(sqlScript, "sqlScript must not be null");
-        synchronized (executionLock) {
-            ensureOpen();
-            List<Statement> statements = Parser.parseScript(sqlScript);
-            List<ResultSet> results = new ArrayList<>(statements.size());
-            for (Statement stmt : statements) {
-                results.add(executeStatementLocked(stmt));
-            }
-            return List.copyOf(results);
+        ensureOpen();
+        List<Statement> statements = Parser.parseScript(sqlScript);
+        List<ResultSet> results = new ArrayList<>(statements.size());
+        for (Statement stmt : statements) {
+            results.add(executeSingleStatement(stmt));
         }
+        return List.copyOf(results);
     }
 
-    private ResultSet executeStatementLocked(Statement statement) {
+    private static boolean isDdlStatement(Statement stmt) {
+        return stmt instanceof Statement.CreateTableStatement
+                || stmt instanceof Statement.DropTableStatement
+                || stmt instanceof Statement.CreateIndexStatement
+                || stmt instanceof Statement.DropIndexStatement
+                || stmt instanceof Statement.CreateDatabaseStatement;
+    }
+
+    private ResultSet executeSingleStatement(Statement statement) {
         long startNanos = System.nanoTime();
-        BoundStatement bound = binder.bind(statement);
-        return executeBoundLocked(bound, startNanos);
+        if (isDdlStatement(statement)) {
+            ddlLock.writeLock().lock();
+            try {
+                ensureOpen();
+                BoundStatement bound = binder.bind(statement);
+                return executeBoundLocked(bound, startNanos);
+            } finally {
+                ddlLock.writeLock().unlock();
+            }
+        } else {
+            ddlLock.readLock().lock();
+            try {
+                ensureOpen();
+                BoundStatement bound = binder.bind(statement);
+                return executeBoundLocked(bound, startNanos);
+            } finally {
+                ddlLock.readLock().unlock();
+            }
+        }
     }
 
     private ResultSet executeBoundLocked(BoundStatement bound, long startNanos) {
@@ -283,29 +309,60 @@ public final class Database implements AutoCloseable {
                 long elapsed = System.nanoTime() - startNanos;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, "DROP INDEX " + indexName);
             }
-            case BoundStatement.BoundSelect select -> {
-                try (Executor executor = executionPlanner.plan(select)) {
-                    executor.init();
-                    List<Tuple> rows = new ArrayList<>();
-                    Tuple tuple;
-                    while ((tuple = executor.next()) != null) {
-                        rows.add(tuple);
-                    }
-                    long elapsed = System.nanoTime() - startNanos;
-                    yield new ResultSet(
-                            executor.getOutputSchema().getColumns(),
-                            rows,
-                            rows.size(),
-                            elapsed,
-                            "SELECT " + rows.size());
-                }
-            }
+            case BoundStatement.BoundSelect select -> executeSelectLocked(select, startNanos);
             case BoundStatement.BoundInsert insert -> executeDmlLocked("INSERT", insert, startNanos);
             case BoundStatement.BoundUpdate update -> executeDmlLocked("UPDATE", update, startNanos);
             case BoundStatement.BoundDelete delete -> executeDmlLocked("DELETE", delete, startNanos);
             case BoundStatement.BoundExplain(boolean analyze, BoundStatement inner) ->
                     executeExplainLocked(analyze, inner, startNanos);
         };
+    }
+
+    private ResultSet executeSelectLocked(BoundStatement.BoundSelect select, long startNanos) {
+        Transaction explicitTxn = getActiveExplicitThreadTxn();
+        if (explicitTxn != null) {
+            transactionManager.bindToCurrentThread(explicitTxn);
+            try (Executor executor = executionPlanner.plan(select)) {
+                executor.init();
+                List<Tuple> rows = new ArrayList<>();
+                Tuple tuple;
+                while ((tuple = executor.next()) != null) {
+                    rows.add(tuple);
+                }
+                long elapsed = System.nanoTime() - startNanos;
+                return new ResultSet(
+                        executor.getOutputSchema().getColumns(),
+                        rows,
+                        rows.size(),
+                        elapsed,
+                        "SELECT " + rows.size());
+            } catch (DeadlockException de) {
+                explicitThreadTxn.remove();
+                transactionManager.rollback(explicitTxn);
+                throw de;
+            } finally {
+                transactionManager.unbindFromCurrentThread();
+            }
+        }
+
+        Transaction readTxn = transactionManager.beginReadOnly();
+        try (Executor executor = executionPlanner.plan(select)) {
+            executor.init();
+            List<Tuple> rows = new ArrayList<>();
+            Tuple tuple;
+            while ((tuple = executor.next()) != null) {
+                rows.add(tuple);
+            }
+            long elapsed = System.nanoTime() - startNanos;
+            return new ResultSet(
+                    executor.getOutputSchema().getColumns(),
+                    rows,
+                    rows.size(),
+                    elapsed,
+                    "SELECT " + rows.size());
+        } finally {
+            transactionManager.endReadOnly(readTxn);
+        }
     }
 
     private Transaction getActiveExplicitThreadTxn() {
@@ -328,6 +385,10 @@ public final class Database implements AutoCloseable {
                 int affected = resultTuple != null ? ((Value.IntValue) resultTuple.getValue(0)).value() : 0;
                 long elapsed = System.nanoTime() - startNanos;
                 return new ResultSet(List.of(), List.of(), affected, elapsed, tag + " " + affected);
+            } catch (DeadlockException de) {
+                explicitThreadTxn.remove();
+                transactionManager.rollback(explicitTxn);
+                throw de;
             } catch (RuntimeException e) {
                 transactionManager.rollbackToSavepoint(explicitTxn, savepoint);
                 throw e;
@@ -418,25 +479,34 @@ public final class Database implements AutoCloseable {
     }
 
     public Transaction beginTransaction() {
-        synchronized (executionLock) {
+        ddlLock.readLock().lock();
+        try {
             ensureOpen();
             Transaction txn = transactionManager.begin(false);
             transactionManager.unbindFromCurrentThread();
             return txn;
+        } finally {
+            ddlLock.readLock().unlock();
         }
     }
 
     public void commitTransaction(Transaction txn) {
-        synchronized (executionLock) {
+        ddlLock.readLock().lock();
+        try {
             ensureOpen();
             transactionManager.commit(txn);
+        } finally {
+            ddlLock.readLock().unlock();
         }
     }
 
     public void rollbackTransaction(Transaction txn) {
-        synchronized (executionLock) {
+        ddlLock.readLock().lock();
+        try {
             ensureOpen();
             transactionManager.rollback(txn);
+        } finally {
+            ddlLock.readLock().unlock();
         }
     }
 
@@ -464,6 +534,10 @@ public final class Database implements AutoCloseable {
         return transactionManager;
     }
 
+    public LockManager getLockManager() {
+        return transactionManager.getLockManager();
+    }
+
     public RecoveryManager getRecoveryManager() {
         return recoveryManager;
     }
@@ -473,16 +547,22 @@ public final class Database implements AutoCloseable {
     }
 
     public CheckpointManager.CheckpointResult checkpoint() {
-        synchronized (executionLock) {
+        ddlLock.writeLock().lock();
+        try {
             ensureOpen();
             return checkpointManager.checkpoint();
+        } finally {
+            ddlLock.writeLock().unlock();
         }
     }
 
     public CheckpointManager.CheckpointResult checkpoint(Map<Long, Long> activeTransactions) {
-        synchronized (executionLock) {
+        ddlLock.writeLock().lock();
+        try {
             ensureOpen();
             return checkpointManager.checkpoint(activeTransactions);
+        } finally {
+            ddlLock.writeLock().unlock();
         }
     }
 
@@ -494,20 +574,27 @@ public final class Database implements AutoCloseable {
 
     @Override
     public void close() {
-        synchronized (executionLock) {
+        ddlLock.writeLock().lock();
+        try {
             if (!closed) {
                 closed = true;
                 explicitThreadTxn.remove();
                 try {
-                    bufferPoolManager.close();
+                    transactionManager.close();
                 } finally {
                     try {
-                        logManager.close();
+                        bufferPoolManager.close();
                     } finally {
-                        diskManager.close();
+                        try {
+                            logManager.close();
+                        } finally {
+                            diskManager.close();
+                        }
                     }
                 }
             }
+        } finally {
+            ddlLock.writeLock().unlock();
         }
     }
 }

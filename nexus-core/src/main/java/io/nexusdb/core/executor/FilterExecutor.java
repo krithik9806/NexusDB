@@ -2,7 +2,13 @@ package io.nexusdb.core.executor;
 
 import io.nexusdb.core.planner.BoundExpr;
 import io.nexusdb.core.record.Schema;
+import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
+import io.nexusdb.core.transaction.LockId;
+import io.nexusdb.core.transaction.LockManager;
+import io.nexusdb.core.transaction.LockMode;
+import io.nexusdb.core.transaction.Transaction;
+import io.nexusdb.core.wal.LogManager;
 
 import java.util.Objects;
 
@@ -22,9 +28,22 @@ public final class FilterExecutor implements Executor {
     public FilterExecutor(Executor child, BoundExpr predicate) {
         this.child = Objects.requireNonNull(child, "child must not be null");
         this.predicate = Objects.requireNonNull(predicate, "predicate must not be null");
+        if (child instanceof SeqScanExecutor seqScan) {
+            seqScan.setDeferRowLockToFilter(true);
+        }
         long childRows = child.getEstimatedRows();
         this.estimatedRows = childRows == 0 ? 0 : Math.max(1L, Math.round(childRows * 0.25));
         this.estimatedCost = child.getEstimatedCost() + childRows * 0.05;
+    }
+
+    public void setLockMode(LockMode mode) {
+        if (child instanceof SeqScanExecutor seqScan) {
+            seqScan.setLockMode(mode);
+        } else if (child instanceof IndexScanExecutor indexScan) {
+            indexScan.setLockMode(mode);
+        } else if (child instanceof FilterExecutor innerFilter) {
+            innerFilter.setLockMode(mode);
+        }
     }
 
     public Executor getChild() {
@@ -50,6 +69,28 @@ public final class FilterExecutor implements Executor {
         try {
             Tuple tuple;
             while ((tuple = child.next()) != null) {
+                if (child instanceof SeqScanExecutor seqScan && tuple.getRecordId() != null) {
+                    if (!ExpressionEvaluator.evaluatePredicate(predicate, tuple)) {
+                        continue;
+                    }
+                    TableHeap heap = seqScan.getTableHeap();
+                    LogManager lm = heap.getBufferPoolManager().getLogManager();
+                    if (lm != null
+                            && lm.getThreadTransactionContext() instanceof Transaction txn
+                            && txn.getLockManager() != null) {
+                        LockManager lockMgr = txn.getLockManager();
+                        LockId rowLockId = LockId.row(seqScan.getTableName(), tuple.getRecordId());
+                        lockMgr.acquire(txn, rowLockId, seqScan.getLockMode());
+                        Tuple fresh = heap.get(tuple.getRecordId());
+                        if (fresh != null && ExpressionEvaluator.evaluatePredicate(predicate, fresh)) {
+                            actualRows++;
+                            return fresh;
+                        }
+                        continue;
+                    }
+                    actualRows++;
+                    return tuple;
+                }
                 if (ExpressionEvaluator.evaluatePredicate(predicate, tuple)) {
                     actualRows++;
                     return tuple;

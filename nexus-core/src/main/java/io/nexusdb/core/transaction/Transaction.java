@@ -18,9 +18,14 @@ public final class Transaction implements LogManager.TransactionLogContext {
     private final long startLsn;
     private volatile long lastLsn;
     private final long startTimestampNanos;
+    private final LockManager lockManager;
     private final List<LogRecord> loggedModifications = new ArrayList<>();
 
     public Transaction(long txnId, long startLsn, boolean autoCommit) {
+        this(txnId, startLsn, autoCommit, null);
+    }
+
+    public Transaction(long txnId, long startLsn, boolean autoCommit, LockManager lockManager) {
         if (txnId <= 0) {
             throw new IllegalArgumentException("txnId must be > 0, got: " + txnId);
         }
@@ -30,6 +35,11 @@ public final class Transaction implements LogManager.TransactionLogContext {
         this.startLsn = startLsn;
         this.lastLsn = startLsn;
         this.startTimestampNanos = System.nanoTime();
+        this.lockManager = lockManager;
+    }
+
+    public LockManager getLockManager() {
+        return lockManager;
     }
 
     @Override

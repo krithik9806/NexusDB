@@ -13,6 +13,10 @@ import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
+import io.nexusdb.core.transaction.LockId;
+import io.nexusdb.core.transaction.LockManager;
+import io.nexusdb.core.transaction.LockMode;
+import io.nexusdb.core.transaction.Transaction;
 import io.nexusdb.core.wal.LogManager;
 
 import java.util.ArrayList;
@@ -80,13 +84,29 @@ public final class InsertExecutor implements Executor {
             }
 
             LogManager lm = heap.getBufferPoolManager().getLogManager();
+            Transaction txn = (lm != null && lm.getThreadTransactionContext() instanceof Transaction t) ? t : null;
+            LockManager lockMgr = txn != null ? txn.getLockManager() : null;
             boolean managedByTxn = lm != null && lm.getThreadTransactionContext() != null;
 
             List<InsertedRowRecord> localInserted = managedByTxn ? null : new ArrayList<>(tuplesToInsert.size());
             int count = 0;
             try {
                 for (Tuple tuple : tuplesToInsert) {
+                    if (lockMgr != null) {
+                        for (IndexMetadata idx : indexes) {
+                            if (idx.unique()) {
+                                int colIdx = schema.getColumnIndex(idx.columnName());
+                                lockMgr.acquire(
+                                        txn,
+                                        LockId.key(table.getName(), idx.indexName(), tuple.getValue(colIdx)),
+                                        LockMode.EXCLUSIVE);
+                            }
+                        }
+                    }
                     RecordId rid = heap.insert(tuple);
+                    if (lockMgr != null) {
+                        lockMgr.acquire(txn, LockId.row(table.getName(), rid), LockMode.EXCLUSIVE);
+                    }
                     int idxPos = 0;
                     try {
                         for (; idxPos < indexes.size(); idxPos++) {
