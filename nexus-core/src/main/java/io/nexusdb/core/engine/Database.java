@@ -12,6 +12,7 @@ import io.nexusdb.core.record.Column;
 import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
+import io.nexusdb.core.recovery.RecoveryManager;
 import io.nexusdb.core.storage.DiskManager;
 import io.nexusdb.core.transaction.Transaction;
 import io.nexusdb.core.transaction.TransactionManager;
@@ -55,6 +56,8 @@ public final class Database implements AutoCloseable {
     private final CheckpointManager checkpointManager;
     private final Catalog catalog;
     private final TransactionManager transactionManager;
+    private final RecoveryManager recoveryManager;
+    private final RecoveryManager.RecoveryReport lastRecoveryReport;
     private final Binder binder;
     private final ExecutionPlanner executionPlanner;
     private final Object executionLock = new Object();
@@ -67,13 +70,17 @@ public final class Database implements AutoCloseable {
             BufferPoolManager bufferPoolManager,
             CheckpointManager checkpointManager,
             Catalog catalog,
-            TransactionManager transactionManager) {
+            TransactionManager transactionManager,
+            RecoveryManager recoveryManager,
+            RecoveryManager.RecoveryReport lastRecoveryReport) {
         this.diskManager = diskManager;
         this.logManager = logManager;
         this.bufferPoolManager = bufferPoolManager;
         this.checkpointManager = checkpointManager;
         this.catalog = catalog;
         this.transactionManager = transactionManager;
+        this.recoveryManager = recoveryManager;
+        this.lastRecoveryReport = lastRecoveryReport;
         this.binder = new Binder(catalog);
         this.executionPlanner = new ExecutionPlanner();
     }
@@ -96,10 +103,28 @@ public final class Database implements AutoCloseable {
             lm = LogManager.open(walFile);
             BufferPoolManager bpm = new BufferPoolManager(bufferPoolSize, dm);
             bpm.setLogManager(lm);
+            TransactionManager tm = new TransactionManager(lm);
+
+            // Run ARIES-lite crash recovery (Analysis -> Redo -> Undo) before opening Catalog
+            RecoveryManager preCatalogRecovery = new RecoveryManager(bpm, lm, null, tm);
+            RecoveryManager.RecoveryReport report = preCatalogRecovery.recover();
+
             Catalog catalog = Catalog.open(bpm);
-            TransactionManager tm = new TransactionManager(lm, catalog);
+            tm.setCatalog(catalog);
+
+            if (report.redoneRecordCount() > 0
+                    || report.undoneRecordCount() > 0
+                    || !report.loserTransactions().isEmpty()) {
+                for (var table : catalog.listTables()) {
+                    table.rebuildIndexesFromHeap();
+                }
+                lm.flush();
+                bpm.flushAll();
+            }
+
             CheckpointManager ckpt = new CheckpointManager(lm, bpm, dm, tm::getActiveTransactionTable);
-            return new Database(dm, lm, bpm, ckpt, catalog, tm);
+            RecoveryManager rm = new RecoveryManager(bpm, lm, catalog, tm);
+            return new Database(dm, lm, bpm, ckpt, catalog, tm, rm, report);
         } catch (RuntimeException e) {
             if (lm != null) {
                 try {
@@ -231,11 +256,13 @@ public final class Database implements AutoCloseable {
                         catalog.createIndex(tableName, pkIndexName, col.name(), true);
                     }
                 }
+                logManager.flush();
                 long elapsed = System.nanoTime() - startNanos;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, "CREATE TABLE " + tableName);
             }
             case BoundStatement.BoundDropTable(String tableName) -> {
                 catalog.dropTable(tableName);
+                logManager.flush();
                 long elapsed = System.nanoTime() - startNanos;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, "DROP TABLE " + tableName);
             }
@@ -245,12 +272,14 @@ public final class Database implements AutoCloseable {
                     String columnName,
                     boolean unique) -> {
                 catalog.createIndex(tableName, indexName, columnName, unique);
+                logManager.flush();
                 long elapsed = System.nanoTime() - startNanos;
                 String tag = (unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ") + indexName;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, tag);
             }
             case BoundStatement.BoundDropIndex(String indexName, String tableName) -> {
                 catalog.dropIndex(tableName, indexName);
+                logManager.flush();
                 long elapsed = System.nanoTime() - startNanos;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, "DROP INDEX " + indexName);
             }
@@ -433,6 +462,14 @@ public final class Database implements AutoCloseable {
 
     public TransactionManager getTransactionManager() {
         return transactionManager;
+    }
+
+    public RecoveryManager getRecoveryManager() {
+        return recoveryManager;
+    }
+
+    public RecoveryManager.RecoveryReport getLastRecoveryReport() {
+        return lastRecoveryReport;
     }
 
     public CheckpointManager.CheckpointResult checkpoint() {

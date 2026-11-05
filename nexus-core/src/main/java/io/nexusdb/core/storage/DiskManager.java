@@ -1,5 +1,7 @@
 package io.nexusdb.core.storage;
 
+import io.nexusdb.core.recovery.CrashFailpoints;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -197,6 +199,29 @@ public final class DiskManager implements AutoCloseable {
         }
     }
 
+    /**
+     * Ensures the database file has at least {@code requiredPageCount} allocated pages during
+     * ARIES Redo recovery so WAL records referencing newly allocated pages can always be replayed.
+     */
+    public void ensurePageCountAtLeast(int requiredPageCount) {
+        if (requiredPageCount <= pageCount.get()) {
+            return;
+        }
+        synchronized (headerLock) {
+            ensureOpen();
+            boolean extended = false;
+            while (pageCount.get() < requiredPageCount) {
+                int newPageId = pageCount.getAndIncrement();
+                ByteBuffer zeroPage = ByteBuffer.allocate(pageSize);
+                writePageInternal(newPageId, zeroPage);
+                extended = true;
+            }
+            if (extended) {
+                writeHeaderPage();
+            }
+        }
+    }
+
     public void readPage(int pageId, ByteBuffer target) {
         ensureOpen();
         validatePageId(pageId);
@@ -229,6 +254,20 @@ public final class DiskManager implements AutoCloseable {
             throw new IllegalArgumentException("Source buffer remaining " + source.remaining() + " < pageSize " + pageSize);
         }
         ByteBuffer slice = source.slice().limit(pageSize);
+        if (CrashFailpoints.isArmed(CrashFailpoints.Point.MID_PAGE_WRITE)) {
+            CrashFailpoints.hit(CrashFailpoints.Point.MID_PAGE_WRITE, () -> {
+                // Simulate a torn page write where only the upper half of the page reaches disk
+                // before power loss, leaving the on-disk header's pageLSN stale so ARIES Redo repairs it.
+                int half = pageSize / 2;
+                ByteBuffer upperHalf = slice.duplicate().position(half).limit(pageSize);
+                long offset = (long) pageId * pageSize + half;
+                try {
+                    writeFully(channel, upperHalf, offset);
+                    channel.force(false);
+                } catch (IOException ignored) {
+                }
+            });
+        }
         writePageInternal(pageId, slice);
         source.position(source.position() + pageSize);
     }

@@ -95,6 +95,13 @@ public final class Catalog {
         return name.toLowerCase(Locale.ROOT);
     }
 
+    /**
+     * Reloads all catalog table and index metadata from disk/buffer pool after ARIES crash recovery.
+     */
+    public void reload() {
+        loadFromDisk();
+    }
+
     private void loadFromDisk() {
         synchronized (catalogLock) {
             tables.clear();

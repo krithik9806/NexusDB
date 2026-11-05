@@ -7,6 +7,7 @@ import io.nexusdb.core.index.BPlusTree;
 import io.nexusdb.core.page.RecordId;
 import io.nexusdb.core.record.TableHeap;
 import io.nexusdb.core.record.Tuple;
+import io.nexusdb.core.recovery.CrashFailpoints;
 import io.nexusdb.core.wal.LogManager;
 import io.nexusdb.core.wal.LogRecord;
 
@@ -41,7 +42,7 @@ public final class TransactionManager {
     private static final byte[] EMPTY_BYTES = new byte[0];
 
     private final LogManager logManager;
-    private final Catalog catalog;
+    private volatile Catalog catalog;
     private final AtomicLong nextTxnId = new AtomicLong(1L);
     private final Map<Long, Transaction> activeTransactions = new ConcurrentHashMap<>();
     private final Map<String, TableHeap> standaloneHeaps = new ConcurrentHashMap<>();
@@ -62,6 +63,10 @@ public final class TransactionManager {
 
     public TransactionManager(LogManager logManager) {
         this(logManager, null);
+    }
+
+    public void setCatalog(Catalog catalog) {
+        this.catalog = catalog;
     }
 
     /**
@@ -125,7 +130,9 @@ public final class TransactionManager {
             try {
                 long commitLsn = logManager.appendCommit(txn.getTxnId(), txn.getLastLsn());
                 txn.setLastLsn(commitLsn);
+                CrashFailpoints.hit(CrashFailpoints.Point.BEFORE_COMMIT_WAL_FLUSH);
                 logManager.flushUpTo(commitLsn);
+                CrashFailpoints.hit(CrashFailpoints.Point.AFTER_COMMIT_WAL_FLUSH);
                 txn.setState(TransactionState.COMMITTED);
                 committedCount.incrementAndGet();
             } finally {

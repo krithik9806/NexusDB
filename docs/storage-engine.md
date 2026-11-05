@@ -220,7 +220,23 @@ The Write-Ahead Log (`LogManager`, `LogRecord`, `LogReader` in `io.nexusdb.core.
    - Appends a `COMMIT` WAL record linked to `txn.getLastLsn()`, forces the WAL up to `commitLsn` (`logManager.flushUpTo(commitLsn)`), transitions state to `COMMITTED`, and removes the transaction from the Active Transaction Table (`ATT`). Under the **No-Force** buffer pool policy, dirty data pages do not need to be flushed to disk at commit time.
 3. **Rollback & Statement-Level Atomicity (`TransactionManager.rollback` / `rollbackToLsn`)**:
    - Walking `txn.getUndoRecords()` in reverse LSN order (`LIFO`), each logged tuple modification is inverted on its slotted heap page (`INSERT` $\rightarrow$ `SlottedPage.delete(slotId)`; `DELETE`/`UPDATE` $\rightarrow$ `SlottedPage.putSlot(slotId, beforeImage)`), a Compensation Log Record (`CLR`) is appended with `undoNextLsn = record.prevLsn()`, the page's `pageLSN` is updated to `clrLsn`, and all affected B+Tree indexes on the modified tables are rebuilt/synchronized with the restored heap.
-   - Full rollback finishes by writing an `ABORT` WAL record and transitioning the transaction to `ABORTED`. When a multi-row `INSERT` or `UPDATE` fails mid-statement (e.g., `DuplicateKeyException`) inside an explicit `BEGIN` block, `rollbackToLsn(txn, statementSavepointLsn)` undoes only the failed statement's changes while keeping earlier statements in the transaction intact.
+   - Full rollback finishes by writing an `ABORT` WAL record and transitioning the transaction to `ABORTED`. When a multi-row `INSERT` or `UPDATE` fails mid-statement (e.g., `DuplicateKeyException`) inside an explicit `BEGIN` block, `rollbackToSavepoint(txn, statementSavepoint)` undoes only the failed statement's changes while keeping earlier statements in the transaction intact.
+
+### ARIES-Lite Crash Recovery (`RecoveryManager`)
+
+On `Database.open(path)`, `RecoveryManager` automatically executes 3-pass ARIES-lite crash recovery:
+
+1. **Pass 1 — Analysis**:
+   - Scans forward from the last valid checkpoint (`DiskManager.getCheckpointLsn()`) or from LSN 1 if no checkpoint exists.
+   - Reconstructs the **Dirty Page Table (`DPT`)** (`pageId -> recLsn`) and the **Active Transaction Table (`ATT`)** (`txnId -> lastLsn`) containing all loser transactions that were still `ACTIVE` at the moment of the crash.
+2. **Pass 2 — Redo (Repeating History)**:
+   - Computes $\text{redoStartLsn} = \min(\{\text{checkpointBeginLsn}\} \cup \{\text{recLsn} \in \text{DPT}\})$ (or LSN 1 without a checkpoint) and scans forward to the end of the WAL.
+   - Replays every logged modification (`pageWrite`, `INSERT`, `UPDATE`, `DELETE`, `CLR`) for both winner and loser transactions whenever `page.getPageLsn() < record.lsn()`, restoring the database to its exact pre-crash state.
+3. **Pass 3 — Undo**:
+   - Rolls back all loser transactions in `ATT` in global reverse LSN order (`max(nextUndoLsn)` across all active losers).
+   - For each undone tuple modification (`INSERT`, `DELETE`, `UPDATE`), appends a `CLR` record with `undoNextLsn = record.prevLsn()` and stamps `page.setPageLsn(clrLsn)`. If recovery encounters a `CLR` written by an earlier interrupted recovery attempt, it never undoes the `CLR` and instead jumps directly to `CLR.undoNextLsn`, making crash recovery strictly idempotent across repeated crashes during recovery.
+   - Once a loser transaction reaches its `BEGIN` record (`prevLsn == 0`), an `ABORT` record is appended. Finally, `Catalog.reload()` and `TableMetadata.rebuildIndexesFromHeap()` synchronize all primary and secondary B+Tree indexes with the recovered table heaps.
+
 
 
 

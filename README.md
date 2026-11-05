@@ -47,7 +47,7 @@ java -jar nexus-client/target/nexus-client-0.1.0-SNAPSHOT.jar --db ./nexusdb-dat
 
 ## Known Limitations
 
-- **Current Implementation Stage**: Phases 1–3 (`v0.1-storage`, `v0.2-sql`, `v0.3-index`) and Tasks 22–24 (`LogRecord`, `LogManager`, `LogReader`, Write-Ahead rule enforcement, Dirty Page Table tracking, `CheckpointManager` fuzzy checkpoints, and `TransactionManager` with `BEGIN`/`COMMIT`/`ROLLBACK` and `CLR`-logged undo) are complete. ARIES-lite crash recovery, Strict 2PL lock manager, Joins/Aggregations, and Multi-Raft are scheduled in the remainder of Phases 4–7.
+- **Current Implementation Stage**: Phases 1–3 (`v0.1-storage`, `v0.2-sql`, `v0.3-index`) and Tasks 22–25 (`LogRecord`, `LogManager`, `LogReader`, Write-Ahead rule enforcement, Dirty Page Table tracking, `CheckpointManager` fuzzy checkpoints, `TransactionManager` with `BEGIN`/`COMMIT`/`ROLLBACK`, and 3-pass ARIES-lite `RecoveryManager` with multi-process crash test harness) are complete. Strict 2PL lock manager, Joins/Aggregations, and Multi-Raft are scheduled in the remainder of Phases 4–7.
 - **Single-Column Index Predicates**: `BPlusTree` indexes and `CostBasedPlanner` index selection currently target single-column primary and secondary indexes; composite multi-column indexes and histograms (beyond uniform selectivity estimation) are not implemented.
 - **Tree-Level B+Tree Lock (`BPlusTree`)**: Concurrent B+Tree searches and mutations are synchronized via a tree-level `ReentrantReadWriteLock` paired with per-page latches rather than fine-grained optimistic latch crabbing.
 - **In-Memory Sorting (`SortExecutor`)**: `ORDER BY` currently materializes and sorts matching rows in heap memory; external merge sort for datasets exceeding available memory is not implemented.

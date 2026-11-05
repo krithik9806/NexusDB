@@ -317,25 +317,20 @@ public final class TableHeap implements Iterable<Tuple> {
             int oldLastPageId = lastPageId;
             Page newRawPage = bufferPoolManager.newPage();
             int newPageId = newRawPage.getPageId();
-            int assignedSlot;
             newRawPage.wlatch();
             try {
                 SlottedPage newSp = new SlottedPage(newRawPage, true);
                 newSp.setPrevPageId(oldLastPageId);
                 newSp.setNextPageId(-1);
-                // Log structural page header setup before tuple insert
+                // Log structural page header setup before linking and tuple insert
                 bufferPoolManager.logPageWrite(newRawPage);
-                assignedSlot = newSp.insert(bytes);
-                if (assignedSlot < 0) {
-                    throw new IllegalStateException("Newly initialized page failed to insert tuple of length " + bytes.length);
-                }
-                logTupleInsert(newRawPage, assignedSlot, bytes);
             } finally {
                 newRawPage.wunlatch();
                 bufferPoolManager.unpinPage(newPageId, true);
             }
 
-            // Link oldLastPage -> newPage
+            // Link oldLastPage -> newPage BEFORE inserting the tuple so any flushed tuple INSERT
+            // record on newPageId is guaranteed to be preceded in the WAL by the page-chain link.
             Page prevPage = bufferPoolManager.fetchPage(oldLastPageId);
             prevPage.wlatch();
             try {
@@ -345,6 +340,21 @@ public final class TableHeap implements Iterable<Tuple> {
             } finally {
                 prevPage.wunlatch();
                 bufferPoolManager.unpinPage(oldLastPageId, true);
+            }
+
+            int assignedSlot;
+            Page linkedNewPage = bufferPoolManager.fetchPage(newPageId);
+            linkedNewPage.wlatch();
+            try {
+                SlottedPage newSp = SlottedPage.wrap(linkedNewPage);
+                assignedSlot = newSp.insert(bytes);
+                if (assignedSlot < 0) {
+                    throw new IllegalStateException("Newly initialized page failed to insert tuple of length " + bytes.length);
+                }
+                logTupleInsert(linkedNewPage, assignedSlot, bytes);
+            } finally {
+                linkedNewPage.wunlatch();
+                bufferPoolManager.unpinPage(newPageId, true);
             }
 
             this.lastPageId = newPageId;
