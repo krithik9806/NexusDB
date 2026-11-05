@@ -16,7 +16,8 @@ public sealed interface BoundExpr
                 BoundExpr.BoundUnaryExpr,
                 BoundExpr.BoundBinaryExpr,
                 BoundExpr.BoundIsNullExpr,
-                BoundExpr.BoundCastExpr {
+                BoundExpr.BoundCastExpr,
+                BoundExpr.BoundAggregate {
 
     /**
      * Resolved static {@link DataType} of this expression, or {@code null} only for an untyped {@code NULL} literal.
@@ -97,6 +98,35 @@ public sealed interface BoundExpr
         public BoundCastExpr {
             Objects.requireNonNull(operand, "operand must not be null");
             Objects.requireNonNull(dataType, "dataType must not be null");
+        }
+    }
+
+    /**
+     * Type-checked aggregate function call ({@code COUNT(*)}, {@code COUNT(expr)}, {@code SUM(expr)},
+     * {@code AVG(expr)}, {@code MIN(expr)}, {@code MAX(expr)}).
+     */
+    record BoundAggregate(
+            Expr.AggregateFunc function,
+            BoundExpr argument,
+            boolean star,
+            DataType dataType) implements BoundExpr {
+        public BoundAggregate {
+            Objects.requireNonNull(function, "function must not be null");
+            Objects.requireNonNull(dataType, "dataType must not be null");
+            if (star) {
+                if (function != Expr.AggregateFunc.COUNT) {
+                    throw new IllegalArgumentException(function + "(*) is not supported; only COUNT(*) is valid");
+                }
+                if (argument != null) {
+                    throw new IllegalArgumentException("COUNT(*) must have a null argument");
+                }
+            } else {
+                Objects.requireNonNull(argument, "argument must not be null when star is false");
+            }
+        }
+
+        public String displayText() {
+            return function.name() + "(" + (star ? "*" : argument) + ")";
         }
     }
 }

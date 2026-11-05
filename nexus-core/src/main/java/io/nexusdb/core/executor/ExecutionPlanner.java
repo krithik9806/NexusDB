@@ -213,6 +213,7 @@ public final class ExecutionPlanner {
         return switch (expr) {
             case BoundExpr.BoundLiteral ignored -> true;
             case BoundExpr.BoundColumnRef ignored -> false;
+            case BoundExpr.BoundAggregate ignored -> false;
             case BoundExpr.BoundUnaryExpr(var ignoredOp, BoundExpr operand, var ignoredType) ->
                     isConstantExpr(operand);
             case BoundExpr.BoundBinaryExpr(BoundExpr left, var ignoredOp, BoundExpr right, var ignoredType) ->

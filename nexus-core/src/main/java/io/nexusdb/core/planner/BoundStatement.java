@@ -95,15 +95,37 @@ public sealed interface BoundStatement
             List<BoundProjection> projections,
             Schema outputSchema,
             BoundExpr where,
+            List<BoundExpr> groupBy,
+            List<BoundExpr.BoundAggregate> aggregates,
+            BoundExpr having,
             List<BoundOrderBy> orderBy,
             Integer limit) implements BoundStatement {
+        public BoundSelect(
+                TableMetadata table,
+                String tableAlias,
+                List<BoundProjection> projections,
+                Schema outputSchema,
+                BoundExpr where,
+                List<BoundOrderBy> orderBy,
+                Integer limit) {
+            this(table, tableAlias, projections, outputSchema, where, List.of(), List.of(), null, orderBy, limit);
+        }
+
         public BoundSelect {
             Objects.requireNonNull(table, "table must not be null");
             Objects.requireNonNull(projections, "projections must not be null");
             Objects.requireNonNull(outputSchema, "outputSchema must not be null");
+            Objects.requireNonNull(groupBy, "groupBy must not be null");
+            Objects.requireNonNull(aggregates, "aggregates must not be null");
             Objects.requireNonNull(orderBy, "orderBy must not be null");
             projections = List.copyOf(projections);
+            groupBy = List.copyOf(groupBy);
+            aggregates = List.copyOf(aggregates);
             orderBy = List.copyOf(orderBy);
+        }
+
+        public boolean isAggregated() {
+            return !groupBy.isEmpty() || !aggregates.isEmpty() || having != null;
         }
     }
 

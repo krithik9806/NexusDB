@@ -55,6 +55,10 @@ public final class ExpressionEvaluator {
                 Value val = evaluate(operand, tuple);
                 yield coerceValue(val, targetType);
             }
+            case BoundExpr.BoundAggregate agg ->
+                    throw new IllegalStateException(
+                            "BoundAggregate must be evaluated by HashAggregateExecutor and rewritten to a post-aggregate column reference: "
+                                    + agg.displayText());
         };
     }
 

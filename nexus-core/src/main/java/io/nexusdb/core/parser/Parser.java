@@ -326,6 +326,19 @@ public final class Parser {
             where = parseExpression();
         }
 
+        List<Expr> groupBy = new ArrayList<>();
+        if (match(TokenType.GROUP)) {
+            consume(TokenType.BY, "Expected 'BY' after 'GROUP'");
+            do {
+                groupBy.add(parseExpression());
+            } while (match(TokenType.COMMA));
+        }
+
+        Expr having = null;
+        if (match(TokenType.HAVING)) {
+            having = parseExpression();
+        }
+
         List<OrderByItem> orderBy = new ArrayList<>();
         if (match(TokenType.ORDER)) {
             consume(TokenType.BY, "Expected 'BY' after 'ORDER'");
@@ -351,7 +364,7 @@ public final class Parser {
             limit = (int) rawLimit;
         }
 
-        return new Statement.SelectStatement(selectItems, from, where, orderBy, limit);
+        return new Statement.SelectStatement(selectItems, from, where, groupBy, having, orderBy, limit);
     }
 
     private SelectItem parseSelectItem() {
@@ -544,6 +557,9 @@ public final class Parser {
             consume(TokenType.RPAREN, "Expected ')' after parenthesized expression");
             return inner;
         }
+        if (match(TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX)) {
+            return parseAggregateCall(previous());
+        }
         if (match(TokenType.IDENTIFIER)) {
             String first = tok.lexeme();
             if (match(TokenType.DOT)) {
@@ -553,6 +569,28 @@ public final class Parser {
             return new Expr.ColumnRefExpr(null, first);
         }
         throw error(tok, "Expected expression, found '" + tok.lexeme() + "'");
+    }
+
+    private Expr.AggregateCall parseAggregateCall(Token funcToken) {
+        Expr.AggregateFunc func = switch (funcToken.type()) {
+            case COUNT -> Expr.AggregateFunc.COUNT;
+            case SUM -> Expr.AggregateFunc.SUM;
+            case AVG -> Expr.AggregateFunc.AVG;
+            case MIN -> Expr.AggregateFunc.MIN;
+            case MAX -> Expr.AggregateFunc.MAX;
+            default -> throw error(funcToken, "Unexpected aggregate function: " + funcToken.lexeme());
+        };
+        consume(TokenType.LPAREN, "Expected '(' after aggregate function '" + funcToken.lexeme() + "'");
+        if (match(TokenType.STAR)) {
+            if (func != Expr.AggregateFunc.COUNT) {
+                throw error(previous(), func.name() + "(*) is not supported; only COUNT(*) is valid");
+            }
+            consume(TokenType.RPAREN, "Expected ')' after 'COUNT(*'");
+            return Expr.AggregateCall.countStar();
+        }
+        Expr arg = parseExpression();
+        consume(TokenType.RPAREN, "Expected ')' after aggregate argument in " + func.name() + "(...)");
+        return Expr.AggregateCall.of(func, arg);
     }
 
     private Token consumeIdentifier(String message) {

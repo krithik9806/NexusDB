@@ -12,7 +12,8 @@ public sealed interface Expr
                 Expr.ColumnRefExpr,
                 Expr.UnaryExpr,
                 Expr.BinaryExpr,
-                Expr.IsNullExpr {
+                Expr.IsNullExpr,
+                Expr.AggregateCall {
 
     /**
      * Literal constant expression (integer, bigint, double, boolean, varchar, or NULL).
@@ -109,6 +110,45 @@ public sealed interface Expr
     record IsNullExpr(Expr operand, boolean negated) implements Expr {
         public IsNullExpr {
             Objects.requireNonNull(operand, "operand must not be null");
+        }
+    }
+
+    /**
+     * SQL aggregate functions supported in NexusDB.
+     */
+    enum AggregateFunc {
+        COUNT,
+        SUM,
+        AVG,
+        MIN,
+        MAX
+    }
+
+    /**
+     * Aggregate function call ({@code COUNT(*)} when {@code star == true} and {@code argument == null},
+     * or {@code FUNC(expr)} when {@code star == false}).
+     */
+    record AggregateCall(AggregateFunc function, Expr argument, boolean star) implements Expr {
+        public AggregateCall {
+            Objects.requireNonNull(function, "function must not be null");
+            if (star) {
+                if (function != AggregateFunc.COUNT) {
+                    throw new IllegalArgumentException(function + "(*) is not supported; only COUNT(*) is valid");
+                }
+                if (argument != null) {
+                    throw new IllegalArgumentException("COUNT(*) must have a null argument");
+                }
+            } else {
+                Objects.requireNonNull(argument, "Aggregate argument must not be null when star is false");
+            }
+        }
+
+        public static AggregateCall countStar() {
+            return new AggregateCall(AggregateFunc.COUNT, null, true);
+        }
+
+        public static AggregateCall of(AggregateFunc function, Expr argument) {
+            return new AggregateCall(function, argument, false);
         }
     }
 }

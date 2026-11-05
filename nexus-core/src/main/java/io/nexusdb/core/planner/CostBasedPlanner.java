@@ -7,6 +7,7 @@ import io.nexusdb.core.executor.DeleteExecutor;
 import io.nexusdb.core.executor.ExecutionPlanner;
 import io.nexusdb.core.executor.Executor;
 import io.nexusdb.core.executor.FilterExecutor;
+import io.nexusdb.core.executor.HashAggregateExecutor;
 import io.nexusdb.core.executor.IndexScanExecutor;
 import io.nexusdb.core.executor.InsertExecutor;
 import io.nexusdb.core.executor.LimitExecutor;
@@ -60,6 +61,12 @@ public final class CostBasedPlanner {
 
     private Executor planSelect(BoundStatement.BoundSelect select) {
         Executor plan = planTableAccess(select.table(), select.where());
+        if (select.isAggregated()) {
+            plan = new HashAggregateExecutor(plan, select.groupBy(), select.aggregates());
+            if (select.having() != null) {
+                plan = new FilterExecutor(plan, select.having());
+            }
+        }
         if (!select.orderBy().isEmpty()) {
             plan = new SortExecutor(plan, select.orderBy());
         }

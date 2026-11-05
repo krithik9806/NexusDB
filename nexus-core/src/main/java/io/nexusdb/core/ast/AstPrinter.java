@@ -57,6 +57,8 @@ public final class AstPrinter {
                     List<SelectItem> items,
                     TableRef from,
                     Expr where,
+                    List<Expr> groupBy,
+                    Expr having,
                     List<OrderByItem> orderBy,
                     Integer limit) -> {
                 StringBuilder sb = new StringBuilder("SELECT ");
@@ -64,6 +66,13 @@ public final class AstPrinter {
                 sb.append(" FROM ").append(printTableRef(from));
                 if (where != null) {
                     sb.append(" WHERE ").append(print(where));
+                }
+                if (!groupBy.isEmpty()) {
+                    sb.append(" GROUP BY ");
+                    sb.append(groupBy.stream().map(AstPrinter::print).collect(Collectors.joining(", ")));
+                }
+                if (having != null) {
+                    sb.append(" HAVING ").append(print(having));
                 }
                 if (!orderBy.isEmpty()) {
                     sb.append(" ORDER BY ");
@@ -131,6 +140,8 @@ public final class AstPrinter {
                 String operandStr = childPrec <= myPrec ? "(" + print(operand) + ")" : print(operand);
                 yield operandStr + (negated ? " IS NOT NULL" : " IS NULL");
             }
+            case Expr.AggregateCall(Expr.AggregateFunc func, Expr arg, boolean star) ->
+                    func.name() + "(" + (star ? "*" : print(arg)) + ")";
         };
     }
 
@@ -188,6 +199,7 @@ public final class AstPrinter {
         return switch (expr) {
             case Expr.LiteralExpr ignored -> 70;
             case Expr.ColumnRefExpr ignored -> 70;
+            case Expr.AggregateCall ignored -> 70;
             case Expr.UnaryExpr(Expr.UnaryOp op, Expr ignoredOperand) -> op == Expr.UnaryOp.NEGATE ? 60 : 25;
             case Expr.BinaryExpr(Expr ignoredLeft, Expr.BinaryOp op, Expr ignoredRight) -> switch (op) {
                 case MUL, DIV -> 50;

@@ -116,25 +116,38 @@ public sealed interface Statement
     }
 
     /**
-     * {@code SELECT <selectItems> FROM <from> [WHERE <where>] [ORDER BY <orderBy>] [LIMIT <limit>]}
+     * {@code SELECT <selectItems> FROM <from> [WHERE <where>] [GROUP BY <groupBy>] [HAVING <having>] [ORDER BY <orderBy>] [LIMIT <limit>]}
      */
     record SelectStatement(
             List<SelectItem> selectItems,
             TableRef from,
             Expr where,
+            List<Expr> groupBy,
+            Expr having,
             List<OrderByItem> orderBy,
             Integer limit) implements Statement {
+        public SelectStatement(
+                List<SelectItem> selectItems,
+                TableRef from,
+                Expr where,
+                List<OrderByItem> orderBy,
+                Integer limit) {
+            this(selectItems, from, where, List.of(), null, orderBy, limit);
+        }
+
         public SelectStatement {
             Objects.requireNonNull(selectItems, "selectItems must not be null");
             if (selectItems.isEmpty()) {
                 throw new IllegalArgumentException("SELECT list must not be empty");
             }
             Objects.requireNonNull(from, "from must not be null");
+            Objects.requireNonNull(groupBy, "groupBy must not be null");
             Objects.requireNonNull(orderBy, "orderBy must not be null");
             if (limit != null && limit < 0) {
                 throw new IllegalArgumentException("LIMIT must be >= 0, got: " + limit);
             }
             selectItems = List.copyOf(selectItems);
+            groupBy = List.copyOf(groupBy);
             orderBy = List.copyOf(orderBy);
         }
     }

@@ -212,7 +212,19 @@ public final class Binder {
         Schema tableSchema = table.getSchema();
         String tableAlias = from.alias();
 
-        List<BoundStatement.BoundProjection> projections = new ArrayList<>();
+        BoundExpr boundWhere = null;
+        if (stmt.where() != null) {
+            boundWhere = bindWherePredicate(stmt.where(), table, tableAlias);
+        }
+
+        List<BoundExpr> boundGroupBy = new ArrayList<>(stmt.groupBy().size());
+        for (Expr gExpr : stmt.groupBy()) {
+            boundGroupBy.add(bindConstantOrRowExpr(gExpr, table, tableAlias, false));
+        }
+
+        boolean hasAggregateInQuery = !boundGroupBy.isEmpty() || stmt.having() != null;
+
+        List<BoundStatement.BoundProjection> rawProjections = new ArrayList<>();
         List<Column> outputColumns = new ArrayList<>();
         Map<String, BoundExpr> aliasMap = new HashMap<>();
         Set<String> ambiguousAliases = new HashSet<>();
@@ -226,17 +238,20 @@ public final class Binder {
                     for (int i = 0; i < tableSchema.getColumnCount(); i++) {
                         Column col = tableSchema.getColumn(i);
                         BoundExpr colRef = new BoundExpr.BoundColumnRef(i, col.name(), col.type());
-                        projections.add(new BoundStatement.BoundProjection(colRef, col.name()));
+                        rawProjections.add(new BoundStatement.BoundProjection(colRef, col.name()));
                         outputColumns.add(
                                 new Column(uniqueOutputColumnName(col.name(), outputColumns), col.type(), col.maxLength(), col.nullable(), false));
                     }
                 }
                 case SelectItem.ExprItem(Expr expr, String alias) -> {
-                    BoundExpr boundExpr = bindConstantOrRowExpr(expr, table, tableAlias);
+                    BoundExpr boundExpr = bindConstantOrRowExpr(expr, table, tableAlias, true);
+                    if (containsAggregate(boundExpr)) {
+                        hasAggregateInQuery = true;
+                    }
                     String outName = alias != null ? alias : deriveColumnName(expr);
                     DataType outType = boundExpr.dataType() != null ? boundExpr.dataType() : DataType.INT;
                     int maxLen = outType == DataType.VARCHAR ? resolveVarcharMaxLength(boundExpr, tableSchema) : outType.getFixedSize();
-                    projections.add(new BoundStatement.BoundProjection(boundExpr, outName));
+                    rawProjections.add(new BoundStatement.BoundProjection(boundExpr, outName));
                     outputColumns.add(
                             new Column(uniqueOutputColumnName(outName, outputColumns), outType, maxLen, true, false));
 
@@ -252,12 +267,27 @@ public final class Binder {
             }
         }
 
-        BoundExpr boundWhere = null;
-        if (stmt.where() != null) {
-            boundWhere = bindWherePredicate(stmt.where(), table, tableAlias);
+        BoundExpr rawHaving = null;
+        if (stmt.having() != null) {
+            rawHaving = bindHavingPredicate(stmt.having(), table, tableAlias);
+            if (containsAggregate(rawHaving)) {
+                hasAggregateInQuery = true;
+            }
         }
 
-        List<BoundStatement.BoundOrderBy> boundOrderBy = new ArrayList<>(stmt.orderBy().size());
+        if (stmt.having() != null && boundGroupBy.isEmpty() && !hasAggregateInQuery) {
+            for (BoundStatement.BoundProjection proj : rawProjections) {
+                if (containsAggregate(proj.expr())) {
+                    hasAggregateInQuery = true;
+                    break;
+                }
+            }
+            if (!hasAggregateInQuery) {
+                throw new BindException("HAVING clause requires a GROUP BY clause or aggregate functions");
+            }
+        }
+
+        List<BoundStatement.BoundOrderBy> rawOrderBy = new ArrayList<>(stmt.orderBy().size());
         for (OrderByItem item : stmt.orderBy()) {
             BoundExpr sortExpr;
             if (item.expr() instanceof Expr.ColumnRefExpr(String qualifier, String colName)
@@ -272,20 +302,62 @@ public final class Binder {
                     throw new BindException("Unknown column '" + colName + "' in ORDER BY");
                 }
                 sortExpr = aliased;
+            } else if (item.expr() instanceof Expr.ColumnRefExpr(String qualifier, String colName)
+                    && qualifier == null
+                    && aliasMap.containsKey(normalize(colName))
+                    && !ambiguousAliases.contains(normalize(colName))) {
+                // If an alias shadows or represents a SELECT item (e.g., an aggregate alias), allow resolving it
+                // unless the column itself is in GROUP BY or the query is unaggregated
+                BoundExpr aliased = aliasMap.get(normalize(colName));
+                if (hasAggregateInQuery && containsAggregate(aliased)) {
+                    sortExpr = aliased;
+                } else {
+                    sortExpr = bindConstantOrRowExpr(item.expr(), table, tableAlias, true);
+                }
             } else {
-                sortExpr = bindConstantOrRowExpr(item.expr(), table, tableAlias);
+                sortExpr = bindConstantOrRowExpr(item.expr(), table, tableAlias, true);
             }
-            boundOrderBy.add(new BoundStatement.BoundOrderBy(sortExpr, item.ascending()));
+            if (containsAggregate(sortExpr)) {
+                hasAggregateInQuery = true;
+            }
+            rawOrderBy.add(new BoundStatement.BoundOrderBy(sortExpr, item.ascending()));
+        }
+
+        List<BoundStatement.BoundProjection> finalProjections;
+        List<BoundExpr.BoundAggregate> aggregates = new ArrayList<>();
+        BoundExpr finalHaving = null;
+        List<BoundStatement.BoundOrderBy> finalOrderBy;
+
+        if (hasAggregateInQuery) {
+            finalProjections = new ArrayList<>(rawProjections.size());
+            for (BoundStatement.BoundProjection proj : rawProjections) {
+                BoundExpr rewritten = rewritePostAggregateExpr(proj.expr(), boundGroupBy, aggregates, "SELECT");
+                finalProjections.add(new BoundStatement.BoundProjection(rewritten, proj.alias()));
+            }
+            if (rawHaving != null) {
+                finalHaving = rewritePostAggregateExpr(rawHaving, boundGroupBy, aggregates, "HAVING");
+            }
+            finalOrderBy = new ArrayList<>(rawOrderBy.size());
+            for (BoundStatement.BoundOrderBy ob : rawOrderBy) {
+                BoundExpr rewrittenSort = rewritePostAggregateExpr(ob.expr(), boundGroupBy, aggregates, "ORDER BY");
+                finalOrderBy.add(new BoundStatement.BoundOrderBy(rewrittenSort, ob.ascending()));
+            }
+        } else {
+            finalProjections = rawProjections;
+            finalOrderBy = rawOrderBy;
         }
 
         Schema outputSchema = new Schema(outputColumns);
         return new BoundStatement.BoundSelect(
                 table,
                 tableAlias,
-                projections,
+                finalProjections,
                 outputSchema,
                 boundWhere,
-                boundOrderBy,
+                boundGroupBy,
+                aggregates,
+                finalHaving,
+                finalOrderBy,
                 stmt.limit());
     }
 
@@ -330,7 +402,7 @@ public final class Binder {
     }
 
     private BoundExpr bindWherePredicate(Expr whereExpr, TableMetadata table, String tableAlias) {
-        BoundExpr bound = bindConstantOrRowExpr(whereExpr, table, tableAlias);
+        BoundExpr bound = bindConstantOrRowExpr(whereExpr, table, tableAlias, false);
         DataType type = bound.dataType();
         if (type != null && type != DataType.BOOLEAN) {
             throw new BindException("WHERE clause must evaluate to BOOLEAN, got " + type);
@@ -341,7 +413,27 @@ public final class Binder {
         return bound;
     }
 
+    private BoundExpr bindHavingPredicate(Expr havingExpr, TableMetadata table, String tableAlias) {
+        BoundExpr bound = bindConstantOrRowExpr(havingExpr, table, tableAlias, true);
+        DataType type = bound.dataType();
+        if (type != null && type != DataType.BOOLEAN) {
+            throw new BindException("HAVING clause must evaluate to BOOLEAN, got " + type);
+        }
+        if (type == null) {
+            return new BoundExpr.BoundLiteral(Value.NULL, DataType.BOOLEAN);
+        }
+        return bound;
+    }
+
     private BoundExpr bindConstantOrRowExpr(Expr expr, TableMetadata table, String tableAlias) {
+        return bindConstantOrRowExpr(expr, table, tableAlias, false);
+    }
+
+    private BoundExpr bindConstantOrRowExpr(
+            Expr expr,
+            TableMetadata table,
+            String tableAlias,
+            boolean allowAggregates) {
         return switch (expr) {
             case Expr.LiteralExpr(Value val) -> new BoundExpr.BoundLiteral(val, val.dataType());
             case Expr.ColumnRefExpr(String qualifier, String colName) -> {
@@ -377,7 +469,7 @@ public final class Binder {
                     }
                 }
 
-                BoundExpr boundOperand = bindConstantOrRowExpr(operand, table, tableAlias);
+                BoundExpr boundOperand = bindConstantOrRowExpr(operand, table, tableAlias, allowAggregates);
                 DataType operandType = boundOperand.dataType();
                 if (op == Expr.UnaryOp.NEGATE) {
                     if (operandType != null && !isNumeric(operandType)) {
@@ -393,14 +485,134 @@ public final class Binder {
                 }
             }
             case Expr.BinaryExpr(Expr left, Expr.BinaryOp op, Expr right) -> {
-                BoundExpr boundLeft = bindConstantOrRowExpr(left, table, tableAlias);
-                BoundExpr boundRight = bindConstantOrRowExpr(right, table, tableAlias);
+                BoundExpr boundLeft = bindConstantOrRowExpr(left, table, tableAlias, allowAggregates);
+                BoundExpr boundRight = bindConstantOrRowExpr(right, table, tableAlias, allowAggregates);
                 yield bindBinaryOp(boundLeft, op, boundRight);
             }
             case Expr.IsNullExpr(Expr operand, boolean negated) -> {
-                BoundExpr boundOperand = bindConstantOrRowExpr(operand, table, tableAlias);
+                BoundExpr boundOperand = bindConstantOrRowExpr(operand, table, tableAlias, allowAggregates);
                 yield new BoundExpr.BoundIsNullExpr(boundOperand, negated);
             }
+            case Expr.AggregateCall(Expr.AggregateFunc func, Expr arg, boolean star) -> {
+                if (!allowAggregates) {
+                    throw new BindException("Aggregate function '" + func.name()
+                            + "' is not allowed in this clause (only SELECT, HAVING, and ORDER BY)");
+                }
+                if (star) {
+                    yield new BoundExpr.BoundAggregate(Expr.AggregateFunc.COUNT, null, true, DataType.BIGINT);
+                }
+                if (containsAstAggregate(arg)) {
+                    throw new BindException("Nested aggregate functions are not allowed in " + func.name() + "(...)");
+                }
+                BoundExpr boundArg = bindConstantOrRowExpr(arg, table, tableAlias, false);
+                DataType argType = boundArg.dataType();
+                DataType returnType = switch (func) {
+                    case COUNT -> DataType.BIGINT;
+                    case SUM -> {
+                        if (argType != null && !isNumeric(argType)) {
+                            throw new BindException("Aggregate SUM requires a numeric argument, got " + argType);
+                        }
+                        yield argType == DataType.DOUBLE ? DataType.DOUBLE : DataType.BIGINT;
+                    }
+                    case AVG -> {
+                        if (argType != null && !isNumeric(argType)) {
+                            throw new BindException("Aggregate AVG requires a numeric argument, got " + argType);
+                        }
+                        yield DataType.DOUBLE;
+                    }
+                    case MIN, MAX -> {
+                        if (argType == DataType.BOOLEAN) {
+                            throw new BindException("Aggregate " + func.name() + " does not support BOOLEAN operand");
+                        }
+                        yield argType != null ? argType : DataType.INT;
+                    }
+                };
+                yield new BoundExpr.BoundAggregate(func, boundArg, false, returnType);
+            }
+        };
+    }
+
+    private static boolean containsAstAggregate(Expr expr) {
+        if (expr == null) {
+            return false;
+        }
+        return switch (expr) {
+            case Expr.AggregateCall ignored -> true;
+            case Expr.LiteralExpr ignored -> false;
+            case Expr.ColumnRefExpr ignored -> false;
+            case Expr.UnaryExpr(var ignoredOp, Expr operand) -> containsAstAggregate(operand);
+            case Expr.BinaryExpr(Expr left, var ignoredOp, Expr right) ->
+                    containsAstAggregate(left) || containsAstAggregate(right);
+            case Expr.IsNullExpr(Expr operand, boolean ignoredNeg) -> containsAstAggregate(operand);
+        };
+    }
+
+    private static boolean containsAggregate(BoundExpr expr) {
+        if (expr == null) {
+            return false;
+        }
+        return switch (expr) {
+            case BoundExpr.BoundAggregate ignored -> true;
+            case BoundExpr.BoundLiteral ignored -> false;
+            case BoundExpr.BoundColumnRef ignored -> false;
+            case BoundExpr.BoundUnaryExpr(var ignoredOp, BoundExpr operand, var ignoredType) ->
+                    containsAggregate(operand);
+            case BoundExpr.BoundBinaryExpr(BoundExpr left, var ignoredOp, BoundExpr right, var ignoredType) ->
+                    containsAggregate(left) || containsAggregate(right);
+            case BoundExpr.BoundIsNullExpr(BoundExpr operand, boolean ignoredNeg) ->
+                    containsAggregate(operand);
+            case BoundExpr.BoundCastExpr(BoundExpr operand, var ignoredType) ->
+                    containsAggregate(operand);
+        };
+    }
+
+    private static BoundExpr rewritePostAggregateExpr(
+            BoundExpr expr,
+            List<BoundExpr> groupBy,
+            List<BoundExpr.BoundAggregate> aggregates,
+            String clauseName) {
+        int groupIdx = groupBy.indexOf(expr);
+        if (groupIdx >= 0) {
+            String colName = expr instanceof BoundExpr.BoundColumnRef(int ignored, String name, var ignoredType)
+                    ? name
+                    : "group_" + groupIdx;
+            DataType dt = expr.dataType() != null ? expr.dataType() : DataType.INT;
+            return new BoundExpr.BoundColumnRef(groupIdx, colName, dt);
+        }
+
+        return switch (expr) {
+            case BoundExpr.BoundAggregate agg -> {
+                int aggIdx = aggregates.indexOf(agg);
+                if (aggIdx < 0) {
+                    aggIdx = aggregates.size();
+                    aggregates.add(agg);
+                }
+                int slotIdx = groupBy.size() + aggIdx;
+                yield new BoundExpr.BoundColumnRef(slotIdx, agg.displayText(), agg.dataType());
+            }
+            case BoundExpr.BoundColumnRef colRef ->
+                    throw new BindException("Column '" + colRef.columnName() + "' in " + clauseName
+                            + " must appear in the GROUP BY clause or be used in an aggregate function");
+            case BoundExpr.BoundLiteral lit -> lit;
+            case BoundExpr.BoundUnaryExpr(Expr.UnaryOp op, BoundExpr operand, DataType dt) ->
+                    new BoundExpr.BoundUnaryExpr(
+                            op,
+                            rewritePostAggregateExpr(operand, groupBy, aggregates, clauseName),
+                            dt);
+            case BoundExpr.BoundBinaryExpr(BoundExpr left, Expr.BinaryOp op, BoundExpr right, DataType dt) ->
+                    new BoundExpr.BoundBinaryExpr(
+                            rewritePostAggregateExpr(left, groupBy, aggregates, clauseName),
+                            op,
+                            rewritePostAggregateExpr(right, groupBy, aggregates, clauseName),
+                            dt);
+            case BoundExpr.BoundIsNullExpr(BoundExpr operand, boolean negated) ->
+                    new BoundExpr.BoundIsNullExpr(
+                            rewritePostAggregateExpr(operand, groupBy, aggregates, clauseName),
+                            negated);
+            case BoundExpr.BoundCastExpr(BoundExpr operand, DataType dt) ->
+                    new BoundExpr.BoundCastExpr(
+                            rewritePostAggregateExpr(operand, groupBy, aggregates, clauseName),
+                            dt);
         };
     }
 
