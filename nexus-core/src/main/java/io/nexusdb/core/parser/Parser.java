@@ -1,8 +1,12 @@
 package io.nexusdb.core.parser;
 
+import io.nexusdb.core.ast.Assignment;
 import io.nexusdb.core.ast.ColumnDef;
 import io.nexusdb.core.ast.Expr;
+import io.nexusdb.core.ast.OrderByItem;
+import io.nexusdb.core.ast.SelectItem;
 import io.nexusdb.core.ast.Statement;
+import io.nexusdb.core.ast.TableRef;
 import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.record.Value;
 
@@ -12,6 +16,19 @@ import java.util.Objects;
 
 /**
  * Recursive-descent SQL parser producing immutable AST nodes in {@code io.nexusdb.core.ast}.
+ *
+ * <p>Operator Precedence Invariant (lowest to highest, per {@code docs/sql-engine.md}):
+ * <ol>
+ *   <li>{@code OR} (left-associative)</li>
+ *   <li>{@code AND} (left-associative)</li>
+ *   <li>{@code NOT} (right-associative prefix)</li>
+ *   <li>Comparison ({@code =}, {@code !=}, {@code <>}, {@code <}, {@code <=}, {@code >}, {@code >=},
+ *       {@code IS NULL}, {@code IS NOT NULL}) (non-associative)</li>
+ *   <li>Additive ({@code +}, {@code -}) (left-associative)</li>
+ *   <li>Multiplicative ({@code *}, {@code /}) (left-associative)</li>
+ *   <li>Unary negation ({@code -}) (right-associative prefix)</li>
+ *   <li>Primary (literals, column refs {@code col} / {@code tbl.col}, parenthesized expressions)</li>
+ * </ol>
  */
 public final class Parser {
     private final List<Token> tokens;
@@ -35,16 +52,27 @@ public final class Parser {
         return new Parser(tokens).parseStatement();
     }
 
+    public static Expr parseExpr(String exprSql) {
+        Objects.requireNonNull(exprSql, "exprSql must not be null");
+        List<Token> tokens;
+        try {
+            tokens = Lexer.tokenize(exprSql);
+        } catch (LexerException e) {
+            throw new ParseException(e.getMessage(), e.getLine(), e.getColumn(), e);
+        }
+        Parser parser = new Parser(tokens);
+        Expr expr = parser.parseExpression();
+        if (!parser.isAtEnd()) {
+            throw parser.error(parser.peek(), "Unexpected token '" + parser.peek().lexeme() + "' after expression");
+        }
+        return expr;
+    }
+
     public Statement parseStatement() {
         if (isAtEnd()) {
             throw error(peek(), "Expected SQL statement but found end of input");
         }
-        Statement stmt = switch (peek().type()) {
-            case CREATE -> parseCreate();
-            case DROP -> parseDrop();
-            case INSERT -> parseInsert();
-            default -> throw error(peek(), "Unexpected token '" + peek().lexeme() + "' at start of statement");
-        };
+        Statement stmt = parseCoreStatement();
 
         // Optional trailing semicolon
         match(TokenType.SEMICOLON);
@@ -52,6 +80,32 @@ public final class Parser {
             throw error(peek(), "Unexpected token '" + peek().lexeme() + "' after end of statement");
         }
         return stmt;
+    }
+
+    private Statement parseCoreStatement() {
+        return switch (peek().type()) {
+            case EXPLAIN -> parseExplain();
+            case CREATE -> parseCreate();
+            case DROP -> parseDrop();
+            case INSERT -> parseInsert();
+            case SELECT -> parseSelect();
+            case UPDATE -> parseUpdate();
+            case DELETE -> parseDelete();
+            default -> throw error(peek(), "Unexpected token '" + peek().lexeme() + "' at start of statement");
+        };
+    }
+
+    private Statement.ExplainStatement parseExplain() {
+        consume(TokenType.EXPLAIN, "Expected 'EXPLAIN'");
+        boolean analyze = match(TokenType.ANALYZE);
+        if (check(TokenType.EXPLAIN)) {
+            throw error(peek(), "Cannot nest EXPLAIN inside EXPLAIN");
+        }
+        if (isAtEnd() || check(TokenType.SEMICOLON)) {
+            throw error(peek(), "Expected SQL statement after EXPLAIN");
+        }
+        Statement target = parseCoreStatement();
+        return new Statement.ExplainStatement(analyze, target);
     }
 
     private Statement parseCreate() {
@@ -177,6 +231,121 @@ public final class Parser {
         } while (match(TokenType.COMMA));
 
         return new Statement.InsertStatement(tableName.lexeme(), columns, rows);
+    }
+
+    private Statement.SelectStatement parseSelect() {
+        consume(TokenType.SELECT, "Expected 'SELECT'");
+        if (check(TokenType.FROM) || isAtEnd()) {
+            throw error(peek(), "Expected select projection list after 'SELECT'");
+        }
+
+        List<SelectItem> selectItems = new ArrayList<>();
+        do {
+            selectItems.add(parseSelectItem());
+        } while (match(TokenType.COMMA));
+
+        consume(TokenType.FROM, "Expected 'FROM' after SELECT list");
+        TableRef from = parseTableRef();
+
+        Expr where = null;
+        if (match(TokenType.WHERE)) {
+            where = parseExpression();
+        }
+
+        List<OrderByItem> orderBy = new ArrayList<>();
+        if (match(TokenType.ORDER)) {
+            consume(TokenType.BY, "Expected 'BY' after 'ORDER'");
+            do {
+                Expr sortExpr = parseExpression();
+                boolean ascending = true;
+                if (match(TokenType.ASC)) {
+                    ascending = true;
+                } else if (match(TokenType.DESC)) {
+                    ascending = false;
+                }
+                orderBy.add(new OrderByItem(sortExpr, ascending));
+            } while (match(TokenType.COMMA));
+        }
+
+        Integer limit = null;
+        if (match(TokenType.LIMIT)) {
+            Token limitTok = consume(TokenType.INTEGER_LITERAL, "Expected non-negative integer literal after 'LIMIT'");
+            long rawLimit = (Long) limitTok.literal();
+            if (rawLimit < 0 || rawLimit > Integer.MAX_VALUE) {
+                throw error(limitTok, "LIMIT out of range: " + rawLimit);
+            }
+            limit = (int) rawLimit;
+        }
+
+        return new Statement.SelectStatement(selectItems, from, where, orderBy, limit);
+    }
+
+    private SelectItem parseSelectItem() {
+        if (match(TokenType.STAR)) {
+            return new SelectItem.AllColumns(null);
+        }
+        if (check(TokenType.IDENTIFIER)
+                && checkAt(1, TokenType.DOT)
+                && checkAt(2, TokenType.STAR)) {
+            Token qualifier = advance();
+            advance(); // DOT
+            advance(); // STAR
+            return new SelectItem.AllColumns(qualifier.lexeme());
+        }
+
+        Expr expr = parseExpression();
+        String alias = null;
+        if (match(TokenType.AS)) {
+            Token aliasTok = consumeIdentifier("Expected alias identifier after 'AS'");
+            alias = aliasTok.lexeme();
+        } else if (check(TokenType.IDENTIFIER)) {
+            alias = advance().lexeme();
+        }
+        return new SelectItem.ExprItem(expr, alias);
+    }
+
+    private TableRef parseTableRef() {
+        Token tableTok = consumeIdentifier("Expected table name after 'FROM'");
+        String alias = null;
+        if (match(TokenType.AS)) {
+            Token aliasTok = consumeIdentifier("Expected table alias identifier after 'AS'");
+            alias = aliasTok.lexeme();
+        } else if (check(TokenType.IDENTIFIER)) {
+            alias = advance().lexeme();
+        }
+        return new TableRef(tableTok.lexeme(), alias);
+    }
+
+    private Statement.UpdateStatement parseUpdate() {
+        consume(TokenType.UPDATE, "Expected 'UPDATE'");
+        Token tableTok = consumeIdentifier("Expected table name after 'UPDATE'");
+        consume(TokenType.SET, "Expected 'SET' after table name in UPDATE");
+
+        List<Assignment> assignments = new ArrayList<>();
+        do {
+            Token colTok = consumeIdentifier("Expected column name in SET assignment");
+            consume(TokenType.EQ, "Expected '=' after column name '" + colTok.lexeme() + "' in SET clause");
+            Expr valExpr = parseExpression();
+            assignments.add(new Assignment(colTok.lexeme(), valExpr));
+        } while (match(TokenType.COMMA));
+
+        Expr where = null;
+        if (match(TokenType.WHERE)) {
+            where = parseExpression();
+        }
+        return new Statement.UpdateStatement(tableTok.lexeme(), assignments, where);
+    }
+
+    private Statement.DeleteStatement parseDelete() {
+        consume(TokenType.DELETE, "Expected 'DELETE'");
+        consume(TokenType.FROM, "Expected 'FROM' after 'DELETE'");
+        Token tableTok = consumeIdentifier("Expected table name after 'DELETE FROM'");
+
+        Expr where = null;
+        if (match(TokenType.WHERE)) {
+            where = parseExpression();
+        }
+        return new Statement.DeleteStatement(tableTok.lexeme(), where);
     }
 
     // Expression hierarchy (or -> and -> not -> predicate -> additive -> multiplicative -> unary -> primary)
@@ -338,6 +507,14 @@ public final class Parser {
             return type == TokenType.EOF;
         }
         return peek().type() == type;
+    }
+
+    private boolean checkAt(int offset, TokenType type) {
+        int idx = current + offset;
+        if (idx >= tokens.size()) {
+            return false;
+        }
+        return tokens.get(idx).type() == type;
     }
 
     private Token advance() {

@@ -10,7 +10,11 @@ public sealed interface Statement
         permits Statement.CreateDatabaseStatement,
                 Statement.CreateTableStatement,
                 Statement.DropTableStatement,
-                Statement.InsertStatement {
+                Statement.InsertStatement,
+                Statement.SelectStatement,
+                Statement.UpdateStatement,
+                Statement.DeleteStatement,
+                Statement.ExplainStatement {
 
     /**
      * {@code CREATE DATABASE <databaseName>}
@@ -66,6 +70,75 @@ public sealed interface Statement
             }
             columns = List.copyOf(columns);
             rows = rows.stream().map(List::copyOf).toList();
+        }
+    }
+
+    /**
+     * {@code SELECT <selectItems> FROM <from> [WHERE <where>] [ORDER BY <orderBy>] [LIMIT <limit>]}
+     */
+    record SelectStatement(
+            List<SelectItem> selectItems,
+            TableRef from,
+            Expr where,
+            List<OrderByItem> orderBy,
+            Integer limit) implements Statement {
+        public SelectStatement {
+            Objects.requireNonNull(selectItems, "selectItems must not be null");
+            if (selectItems.isEmpty()) {
+                throw new IllegalArgumentException("SELECT list must not be empty");
+            }
+            Objects.requireNonNull(from, "from must not be null");
+            Objects.requireNonNull(orderBy, "orderBy must not be null");
+            if (limit != null && limit < 0) {
+                throw new IllegalArgumentException("LIMIT must be >= 0, got: " + limit);
+            }
+            selectItems = List.copyOf(selectItems);
+            orderBy = List.copyOf(orderBy);
+        }
+    }
+
+    /**
+     * {@code UPDATE <tableName> SET <assignments> [WHERE <where>]}
+     */
+    record UpdateStatement(
+            String tableName,
+            List<Assignment> assignments,
+            Expr where) implements Statement {
+        public UpdateStatement {
+            Objects.requireNonNull(tableName, "tableName must not be null");
+            Objects.requireNonNull(assignments, "assignments must not be null");
+            if (assignments.isEmpty()) {
+                throw new IllegalArgumentException("UPDATE must have at least one SET assignment");
+            }
+            assignments = List.copyOf(assignments);
+        }
+    }
+
+    /**
+     * {@code DELETE FROM <tableName> [WHERE <where>]}
+     */
+    record DeleteStatement(
+            String tableName,
+            Expr where) implements Statement {
+        public DeleteStatement {
+            Objects.requireNonNull(tableName, "tableName must not be null");
+            if (tableName.isBlank()) {
+                throw new IllegalArgumentException("tableName must not be blank");
+            }
+        }
+    }
+
+    /**
+     * {@code EXPLAIN [ANALYZE] <statement>}
+     */
+    record ExplainStatement(
+            boolean analyze,
+            Statement statement) implements Statement {
+        public ExplainStatement {
+            Objects.requireNonNull(statement, "statement must not be null");
+            if (statement instanceof ExplainStatement) {
+                throw new IllegalArgumentException("Cannot nest EXPLAIN inside EXPLAIN");
+            }
         }
     }
 }
