@@ -66,6 +66,7 @@ Data pages (heap pages and catalog pages) use a **Slotted Page** organization so
 - **`RecordId`**: Immutable record `(int pageId, int slotId)` uniquely identifying a tuple's location.
 - **Deletion**: Sets the slot's `tupleOffset = -1` and `tupleLength = 0`, adding the old length to `fragmentedBytes`.
 - **Insertion**: Reuses the first slot with `tupleOffset == -1` if available, or appends a new slot at `slotCount`. If contiguous space (`freeSpacePointer - slotArrayEnd`) is insufficient but total free space (`contiguous + fragmentedBytes`) is sufficient, in-page **compaction** packs active tuples continuously at the end of the page while preserving all `slotId`s.
+- **Updates & Cross-Page Relocation (`TableHeap.update`)**: When a tuple is updated, `SlottedPage.update` updates it in-place if `newLength <= oldLength` or relocates it within the same page (compacting if required) if `newLength - oldLength <= totalFreeSpace`, preserving its `RecordId(pageId, slotId)`. If the updated tuple exceeds the current page's free capacity, `TableHeap.update` deletes the old slot on the source page and inserts the tuple into the tail heap page (allocating a new linked page if needed), returning the relocated `RecordId`.
 
 ---
 
