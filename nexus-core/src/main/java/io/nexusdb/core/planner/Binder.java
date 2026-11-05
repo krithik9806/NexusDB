@@ -4,6 +4,7 @@ import io.nexusdb.core.ast.Assignment;
 import io.nexusdb.core.ast.AstPrinter;
 import io.nexusdb.core.ast.ColumnDef;
 import io.nexusdb.core.ast.Expr;
+import io.nexusdb.core.ast.JoinClause;
 import io.nexusdb.core.ast.OrderByItem;
 import io.nexusdb.core.ast.SelectItem;
 import io.nexusdb.core.ast.Statement;
@@ -206,20 +207,55 @@ public final class Binder {
         return new BoundStatement.BoundInsert(table, boundRows);
     }
 
+    private record TableScope(TableMetadata table, String alias, int startColIdx) {
+        String effectiveName() {
+            return alias != null ? alias : table.getName();
+        }
+    }
+
     private BoundStatement.BoundSelect bindSelect(Statement.SelectStatement stmt) {
         TableRef from = stmt.from();
-        TableMetadata table = requireTable(from.tableName());
-        Schema tableSchema = table.getSchema();
-        String tableAlias = from.alias();
+        TableMetadata baseTable = requireTable(from.tableName());
+        String baseAlias = from.alias();
+
+        List<TableScope> scopes = new ArrayList<>(1 + stmt.joins().size());
+        Set<String> seenEffectiveNames = new HashSet<>();
+        TableScope baseScope = new TableScope(baseTable, baseAlias, 0);
+        scopes.add(baseScope);
+        seenEffectiveNames.add(normalize(baseScope.effectiveName()));
+
+        int currentOffset = baseTable.getSchema().getColumnCount();
+        List<BoundStatement.BoundJoin> boundJoins = new ArrayList<>(stmt.joins().size());
+
+        for (JoinClause joinClause : stmt.joins()) {
+            TableRef rightRef = joinClause.rightTable();
+            TableMetadata rightTable = requireTable(rightRef.tableName());
+            String rightAlias = rightRef.alias();
+            TableScope rightScope = new TableScope(rightTable, rightAlias, currentOffset);
+            String normEff = normalize(rightScope.effectiveName());
+            if (!seenEffectiveNames.add(normEff)) {
+                throw new BindException("Duplicate table name or alias '" + rightScope.effectiveName() + "' in FROM/JOIN");
+            }
+            scopes.add(rightScope);
+            currentOffset += rightTable.getSchema().getColumnCount();
+
+            BoundExpr boundOn = bindJoinOnPredicate(joinClause.condition(), scopes);
+            boundJoins.add(new BoundStatement.BoundJoin(
+                    joinClause.joinType(),
+                    rightTable,
+                    rightAlias,
+                    boundOn,
+                    rightScope.startColIdx()));
+        }
 
         BoundExpr boundWhere = null;
         if (stmt.where() != null) {
-            boundWhere = bindWherePredicate(stmt.where(), table, tableAlias);
+            boundWhere = bindWherePredicate(stmt.where(), scopes);
         }
 
         List<BoundExpr> boundGroupBy = new ArrayList<>(stmt.groupBy().size());
         for (Expr gExpr : stmt.groupBy()) {
-            boundGroupBy.add(bindConstantOrRowExpr(gExpr, table, tableAlias, false));
+            boundGroupBy.add(bindExprWithScopes(gExpr, scopes, false));
         }
 
         boolean hasAggregateInQuery = !boundGroupBy.isEmpty() || stmt.having() != null;
@@ -233,24 +269,44 @@ public final class Binder {
             switch (item) {
                 case SelectItem.AllColumns(String qualifier) -> {
                     if (qualifier != null) {
-                        validateTableQualifier(qualifier, table, tableAlias);
-                    }
-                    for (int i = 0; i < tableSchema.getColumnCount(); i++) {
-                        Column col = tableSchema.getColumn(i);
-                        BoundExpr colRef = new BoundExpr.BoundColumnRef(i, col.name(), col.type());
-                        rawProjections.add(new BoundStatement.BoundProjection(colRef, col.name()));
-                        outputColumns.add(
-                                new Column(uniqueOutputColumnName(col.name(), outputColumns), col.type(), col.maxLength(), col.nullable(), false));
+                        TableScope targetScope = resolveQualifierScope(qualifier, scopes);
+                        Schema s = targetScope.table().getSchema();
+                        for (int i = 0; i < s.getColumnCount(); i++) {
+                            Column col = s.getColumn(i);
+                            int globalIdx = targetScope.startColIdx() + i;
+                            String colLabel = scopes.size() > 1
+                                    ? targetScope.effectiveName() + "." + col.name()
+                                    : col.name();
+                            BoundExpr colRef = new BoundExpr.BoundColumnRef(globalIdx, colLabel, col.type());
+                            rawProjections.add(new BoundStatement.BoundProjection(colRef, col.name()));
+                            outputColumns.add(
+                                    new Column(uniqueOutputColumnName(col.name(), outputColumns), col.type(), col.maxLength(), true, false));
+                        }
+                    } else {
+                        for (TableScope scope : scopes) {
+                            Schema s = scope.table().getSchema();
+                            for (int i = 0; i < s.getColumnCount(); i++) {
+                                Column col = s.getColumn(i);
+                                int globalIdx = scope.startColIdx() + i;
+                                String colLabel = scopes.size() > 1
+                                        ? scope.effectiveName() + "." + col.name()
+                                        : col.name();
+                                BoundExpr colRef = new BoundExpr.BoundColumnRef(globalIdx, colLabel, col.type());
+                                rawProjections.add(new BoundStatement.BoundProjection(colRef, col.name()));
+                                outputColumns.add(
+                                        new Column(uniqueOutputColumnName(col.name(), outputColumns), col.type(), col.maxLength(), true, false));
+                            }
+                        }
                     }
                 }
                 case SelectItem.ExprItem(Expr expr, String alias) -> {
-                    BoundExpr boundExpr = bindConstantOrRowExpr(expr, table, tableAlias, true);
+                    BoundExpr boundExpr = bindExprWithScopes(expr, scopes, true);
                     if (containsAggregate(boundExpr)) {
                         hasAggregateInQuery = true;
                     }
                     String outName = alias != null ? alias : deriveColumnName(expr);
                     DataType outType = boundExpr.dataType() != null ? boundExpr.dataType() : DataType.INT;
-                    int maxLen = outType == DataType.VARCHAR ? resolveVarcharMaxLength(boundExpr, tableSchema) : outType.getFixedSize();
+                    int maxLen = outType == DataType.VARCHAR ? resolveVarcharMaxLength(boundExpr, scopes) : outType.getFixedSize();
                     rawProjections.add(new BoundStatement.BoundProjection(boundExpr, outName));
                     outputColumns.add(
                             new Column(uniqueOutputColumnName(outName, outputColumns), outType, maxLen, true, false));
@@ -269,7 +325,7 @@ public final class Binder {
 
         BoundExpr rawHaving = null;
         if (stmt.having() != null) {
-            rawHaving = bindHavingPredicate(stmt.having(), table, tableAlias);
+            rawHaving = bindHavingPredicate(stmt.having(), scopes);
             if (containsAggregate(rawHaving)) {
                 hasAggregateInQuery = true;
             }
@@ -292,7 +348,7 @@ public final class Binder {
             BoundExpr sortExpr;
             if (item.expr() instanceof Expr.ColumnRefExpr(String qualifier, String colName)
                     && qualifier == null
-                    && !tableSchema.hasColumn(colName)) {
+                    && !hasUnqualifiedColumn(colName, scopes)) {
                 String norm = normalize(colName);
                 if (ambiguousAliases.contains(norm)) {
                     throw new BindException("Ambiguous SELECT alias '" + colName + "' in ORDER BY");
@@ -306,16 +362,14 @@ public final class Binder {
                     && qualifier == null
                     && aliasMap.containsKey(normalize(colName))
                     && !ambiguousAliases.contains(normalize(colName))) {
-                // If an alias shadows or represents a SELECT item (e.g., an aggregate alias), allow resolving it
-                // unless the column itself is in GROUP BY or the query is unaggregated
                 BoundExpr aliased = aliasMap.get(normalize(colName));
                 if (hasAggregateInQuery && containsAggregate(aliased)) {
                     sortExpr = aliased;
                 } else {
-                    sortExpr = bindConstantOrRowExpr(item.expr(), table, tableAlias, true);
+                    sortExpr = bindExprWithScopes(item.expr(), scopes, true);
                 }
             } else {
-                sortExpr = bindConstantOrRowExpr(item.expr(), table, tableAlias, true);
+                sortExpr = bindExprWithScopes(item.expr(), scopes, true);
             }
             if (containsAggregate(sortExpr)) {
                 hasAggregateInQuery = true;
@@ -349,8 +403,9 @@ public final class Binder {
 
         Schema outputSchema = new Schema(outputColumns);
         return new BoundStatement.BoundSelect(
-                table,
-                tableAlias,
+                baseTable,
+                baseAlias,
+                boundJoins,
                 finalProjections,
                 outputSchema,
                 boundWhere,
@@ -402,7 +457,12 @@ public final class Binder {
     }
 
     private BoundExpr bindWherePredicate(Expr whereExpr, TableMetadata table, String tableAlias) {
-        BoundExpr bound = bindConstantOrRowExpr(whereExpr, table, tableAlias, false);
+        List<TableScope> scopes = table == null ? List.of() : List.of(new TableScope(table, tableAlias, 0));
+        return bindWherePredicate(whereExpr, scopes);
+    }
+
+    private BoundExpr bindWherePredicate(Expr whereExpr, List<TableScope> scopes) {
+        BoundExpr bound = bindExprWithScopes(whereExpr, scopes, false);
         DataType type = bound.dataType();
         if (type != null && type != DataType.BOOLEAN) {
             throw new BindException("WHERE clause must evaluate to BOOLEAN, got " + type);
@@ -413,8 +473,20 @@ public final class Binder {
         return bound;
     }
 
-    private BoundExpr bindHavingPredicate(Expr havingExpr, TableMetadata table, String tableAlias) {
-        BoundExpr bound = bindConstantOrRowExpr(havingExpr, table, tableAlias, true);
+    private BoundExpr bindJoinOnPredicate(Expr onExpr, List<TableScope> scopes) {
+        BoundExpr bound = bindExprWithScopes(onExpr, scopes, false);
+        DataType type = bound.dataType();
+        if (type != null && type != DataType.BOOLEAN) {
+            throw new BindException("JOIN ON clause must evaluate to BOOLEAN, got " + type);
+        }
+        if (type == null) {
+            return new BoundExpr.BoundLiteral(Value.NULL, DataType.BOOLEAN);
+        }
+        return bound;
+    }
+
+    private BoundExpr bindHavingPredicate(Expr havingExpr, List<TableScope> scopes) {
+        BoundExpr bound = bindExprWithScopes(havingExpr, scopes, true);
         DataType type = bound.dataType();
         if (type != null && type != DataType.BOOLEAN) {
             throw new BindException("HAVING clause must evaluate to BOOLEAN, got " + type);
@@ -426,30 +498,21 @@ public final class Binder {
     }
 
     private BoundExpr bindConstantOrRowExpr(Expr expr, TableMetadata table, String tableAlias) {
-        return bindConstantOrRowExpr(expr, table, tableAlias, false);
+        List<TableScope> scopes = table == null ? List.of() : List.of(new TableScope(table, tableAlias, 0));
+        return bindExprWithScopes(expr, scopes, false);
     }
 
-    private BoundExpr bindConstantOrRowExpr(
+    private BoundExpr bindExprWithScopes(
             Expr expr,
-            TableMetadata table,
-            String tableAlias,
+            List<TableScope> scopes,
             boolean allowAggregates) {
         return switch (expr) {
             case Expr.LiteralExpr(Value val) -> new BoundExpr.BoundLiteral(val, val.dataType());
             case Expr.ColumnRefExpr(String qualifier, String colName) -> {
-                if (table == null) {
+                if (scopes.isEmpty()) {
                     throw new BindException("Column reference '" + colName + "' is not allowed in INSERT VALUES");
                 }
-                if (qualifier != null) {
-                    validateTableQualifier(qualifier, table, tableAlias);
-                }
-                Schema schema = table.getSchema();
-                int idx = schema.getColumnIndex(colName);
-                if (idx < 0) {
-                    throw new BindException("Unknown column '" + colName + "' in table '" + table.getName() + "'");
-                }
-                Column col = schema.getColumn(idx);
-                yield new BoundExpr.BoundColumnRef(idx, col.name(), col.type());
+                yield resolveColumnRef(qualifier, colName, scopes);
             }
             case Expr.UnaryExpr(Expr.UnaryOp op, Expr operand) -> {
                 // Fold negative numeric literals directly (handles -2147483648 as INT)
@@ -469,7 +532,7 @@ public final class Binder {
                     }
                 }
 
-                BoundExpr boundOperand = bindConstantOrRowExpr(operand, table, tableAlias, allowAggregates);
+                BoundExpr boundOperand = bindExprWithScopes(operand, scopes, allowAggregates);
                 DataType operandType = boundOperand.dataType();
                 if (op == Expr.UnaryOp.NEGATE) {
                     if (operandType != null && !isNumeric(operandType)) {
@@ -485,12 +548,12 @@ public final class Binder {
                 }
             }
             case Expr.BinaryExpr(Expr left, Expr.BinaryOp op, Expr right) -> {
-                BoundExpr boundLeft = bindConstantOrRowExpr(left, table, tableAlias, allowAggregates);
-                BoundExpr boundRight = bindConstantOrRowExpr(right, table, tableAlias, allowAggregates);
+                BoundExpr boundLeft = bindExprWithScopes(left, scopes, allowAggregates);
+                BoundExpr boundRight = bindExprWithScopes(right, scopes, allowAggregates);
                 yield bindBinaryOp(boundLeft, op, boundRight);
             }
             case Expr.IsNullExpr(Expr operand, boolean negated) -> {
-                BoundExpr boundOperand = bindConstantOrRowExpr(operand, table, tableAlias, allowAggregates);
+                BoundExpr boundOperand = bindExprWithScopes(operand, scopes, allowAggregates);
                 yield new BoundExpr.BoundIsNullExpr(boundOperand, negated);
             }
             case Expr.AggregateCall(Expr.AggregateFunc func, Expr arg, boolean star) -> {
@@ -504,7 +567,7 @@ public final class Binder {
                 if (containsAstAggregate(arg)) {
                     throw new BindException("Nested aggregate functions are not allowed in " + func.name() + "(...)");
                 }
-                BoundExpr boundArg = bindConstantOrRowExpr(arg, table, tableAlias, false);
+                BoundExpr boundArg = bindExprWithScopes(arg, scopes, false);
                 DataType argType = boundArg.dataType();
                 DataType returnType = switch (func) {
                     case COUNT -> DataType.BIGINT;
@@ -530,6 +593,75 @@ public final class Binder {
                 yield new BoundExpr.BoundAggregate(func, boundArg, false, returnType);
             }
         };
+    }
+
+    private static BoundExpr.BoundColumnRef resolveColumnRef(
+            String qualifier,
+            String colName,
+            List<TableScope> scopes) {
+        if (qualifier != null) {
+            TableScope scope = resolveQualifierScope(qualifier, scopes);
+            Schema schema = scope.table().getSchema();
+            int idx = schema.getColumnIndex(colName);
+            if (idx < 0) {
+                throw new BindException("Unknown column '" + qualifier + "." + colName + "' in table '"
+                        + scope.table().getName() + "'");
+            }
+            Column col = schema.getColumn(idx);
+            String label = scopes.size() > 1 ? scope.effectiveName() + "." + col.name() : col.name();
+            return new BoundExpr.BoundColumnRef(scope.startColIdx() + idx, label, col.type());
+        }
+
+        TableScope matchedScope = null;
+        int matchedLocalIdx = -1;
+        for (TableScope scope : scopes) {
+            int idx = scope.table().getSchema().getColumnIndex(colName);
+            if (idx >= 0) {
+                if (matchedScope != null) {
+                    throw new BindException("Ambiguous column reference '" + colName
+                            + "' (present in both '" + matchedScope.effectiveName()
+                            + "' and '" + scope.effectiveName() + "')");
+                }
+                matchedScope = scope;
+                matchedLocalIdx = idx;
+            }
+        }
+        if (matchedScope == null) {
+            throw new BindException("Unknown column '" + colName + "'");
+        }
+        Column col = matchedScope.table().getSchema().getColumn(matchedLocalIdx);
+        String label = scopes.size() > 1 ? matchedScope.effectiveName() + "." + col.name() : col.name();
+        return new BoundExpr.BoundColumnRef(matchedScope.startColIdx() + matchedLocalIdx, label, col.type());
+    }
+
+    private static boolean hasUnqualifiedColumn(String colName, List<TableScope> scopes) {
+        for (TableScope scope : scopes) {
+            if (scope.table().getSchema().hasColumn(colName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static TableScope resolveQualifierScope(String qualifier, List<TableScope> scopes) {
+        for (TableScope scope : scopes) {
+            if (scope.alias() != null && scope.alias().equalsIgnoreCase(qualifier)) {
+                return scope;
+            }
+        }
+        TableScope byTableName = null;
+        for (TableScope scope : scopes) {
+            if (scope.table().getName().equalsIgnoreCase(qualifier)) {
+                if (byTableName != null) {
+                    throw new BindException("Ambiguous table qualifier '" + qualifier + "'");
+                }
+                byTableName = scope;
+            }
+        }
+        if (byTableName != null) {
+            return byTableName;
+        }
+        throw new BindException("Unknown table qualifier '" + qualifier + "'");
     }
 
     private static boolean containsAstAggregate(Expr expr) {
@@ -783,9 +915,15 @@ public final class Binder {
         }
     }
 
-    private static int resolveVarcharMaxLength(BoundExpr expr, Schema tableSchema) {
+    private static int resolveVarcharMaxLength(BoundExpr expr, List<TableScope> scopes) {
         if (expr instanceof BoundExpr.BoundColumnRef(int idx, String ignoredName, DataType ignoredType)) {
-            return tableSchema.getColumn(idx).maxLength();
+            for (TableScope scope : scopes) {
+                int local = idx - scope.startColIdx();
+                Schema s = scope.table().getSchema();
+                if (local >= 0 && local < s.getColumnCount()) {
+                    return s.getColumn(local).maxLength();
+                }
+            }
         }
         if (expr instanceof BoundExpr.BoundLiteral(Value.VarcharValue(String s), DataType ignoredType)) {
             return Math.max(1, s.length());

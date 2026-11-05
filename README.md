@@ -47,7 +47,7 @@ java -jar nexus-client/target/nexus-client-0.1.0-SNAPSHOT.jar --db ./nexusdb-dat
 
 ## Known Limitations
 
-- **Current Implementation Stage**: Phases 1–4 (`v0.1-storage`, `v0.2-sql`, `v0.3-index`, `v0.4-transactions`) are complete. Joins/Aggregations and Multi-Raft are scheduled in Phases 5–7.
+- **Current Implementation Stage**: Phases 1–4b (`v0.1-storage`, `v0.2-sql`, `v0.3-index`, `v0.4-transactions`, `v0.5-sql-complete`) are complete. Multi-Raft consensus and distributed sharding are scheduled in Phases 5–7.
 - **Strict 2PL Isolation & Phantom Read Limitation (ADR-002)**: Row-level and unique-key Strict 2PL (`SHARED` locks held until commit/abort for `SELECT`, `EXCLUSIVE` locks held until commit/abort for `INSERT`/`UPDATE`/`DELETE`) provides **Repeatable Read** isolation (preventing dirty reads, non-repeatable reads, and lost updates), while readers and writers on the same row block one another. Because next-key / predicate gap locking is not implemented, range scans can observe **phantom reads** when concurrent transactions insert new rows into an open range.
 - **Single-Column Index Predicates**: `BPlusTree` indexes and `CostBasedPlanner` index selection currently target single-column primary and secondary indexes; composite multi-column indexes and histograms (beyond uniform selectivity estimation) are not implemented.
 - **Tree-Level B+Tree Lock (`BPlusTree`)**: Concurrent B+Tree searches and mutations are synchronized via a tree-level `ReentrantReadWriteLock` paired with per-page latches rather than fine-grained optimistic latch crabbing.

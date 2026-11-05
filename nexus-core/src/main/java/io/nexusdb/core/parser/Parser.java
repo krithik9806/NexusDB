@@ -3,6 +3,8 @@ package io.nexusdb.core.parser;
 import io.nexusdb.core.ast.Assignment;
 import io.nexusdb.core.ast.ColumnDef;
 import io.nexusdb.core.ast.Expr;
+import io.nexusdb.core.ast.JoinClause;
+import io.nexusdb.core.ast.JoinType;
 import io.nexusdb.core.ast.OrderByItem;
 import io.nexusdb.core.ast.SelectItem;
 import io.nexusdb.core.ast.Statement;
@@ -321,6 +323,11 @@ public final class Parser {
         consume(TokenType.FROM, "Expected 'FROM' after SELECT list");
         TableRef from = parseTableRef();
 
+        List<JoinClause> joins = new ArrayList<>();
+        while (check(TokenType.JOIN) || check(TokenType.INNER) || check(TokenType.LEFT)) {
+            joins.add(parseJoinClause());
+        }
+
         Expr where = null;
         if (match(TokenType.WHERE)) {
             where = parseExpression();
@@ -364,7 +371,26 @@ public final class Parser {
             limit = (int) rawLimit;
         }
 
-        return new Statement.SelectStatement(selectItems, from, where, groupBy, having, orderBy, limit);
+        return new Statement.SelectStatement(selectItems, from, joins, where, groupBy, having, orderBy, limit);
+    }
+
+    private JoinClause parseJoinClause() {
+        JoinType joinType;
+        if (match(TokenType.INNER)) {
+            consume(TokenType.JOIN, "Expected 'JOIN' after 'INNER'");
+            joinType = JoinType.INNER;
+        } else if (match(TokenType.LEFT)) {
+            match(TokenType.OUTER);
+            consume(TokenType.JOIN, "Expected 'JOIN' after 'LEFT'");
+            joinType = JoinType.LEFT;
+        } else {
+            consume(TokenType.JOIN, "Expected 'JOIN'");
+            joinType = JoinType.INNER;
+        }
+        TableRef rightTable = parseTableRef();
+        consume(TokenType.ON, "Expected 'ON' after joined table '" + rightTable.effectiveName() + "'");
+        Expr condition = parseExpression();
+        return new JoinClause(joinType, rightTable, condition);
     }
 
     private SelectItem parseSelectItem() {

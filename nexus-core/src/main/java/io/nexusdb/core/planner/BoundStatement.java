@@ -1,5 +1,6 @@
 package io.nexusdb.core.planner;
 
+import io.nexusdb.core.ast.JoinType;
 import io.nexusdb.core.catalog.TableMetadata;
 import io.nexusdb.core.record.Schema;
 
@@ -89,9 +90,26 @@ public sealed interface BoundStatement
         }
     }
 
+    record BoundJoin(
+            JoinType joinType,
+            TableMetadata rightTable,
+            String rightAlias,
+            BoundExpr condition,
+            int rightStartColumnIndex) {
+        public BoundJoin {
+            Objects.requireNonNull(joinType, "joinType must not be null");
+            Objects.requireNonNull(rightTable, "rightTable must not be null");
+            Objects.requireNonNull(condition, "condition must not be null");
+            if (rightStartColumnIndex < 0) {
+                throw new IllegalArgumentException("rightStartColumnIndex must be >= 0");
+            }
+        }
+    }
+
     record BoundSelect(
             TableMetadata table,
             String tableAlias,
+            List<BoundJoin> joins,
             List<BoundProjection> projections,
             Schema outputSchema,
             BoundExpr where,
@@ -108,16 +126,32 @@ public sealed interface BoundStatement
                 BoundExpr where,
                 List<BoundOrderBy> orderBy,
                 Integer limit) {
-            this(table, tableAlias, projections, outputSchema, where, List.of(), List.of(), null, orderBy, limit);
+            this(table, tableAlias, List.of(), projections, outputSchema, where, List.of(), List.of(), null, orderBy, limit);
+        }
+
+        public BoundSelect(
+                TableMetadata table,
+                String tableAlias,
+                List<BoundProjection> projections,
+                Schema outputSchema,
+                BoundExpr where,
+                List<BoundExpr> groupBy,
+                List<BoundExpr.BoundAggregate> aggregates,
+                BoundExpr having,
+                List<BoundOrderBy> orderBy,
+                Integer limit) {
+            this(table, tableAlias, List.of(), projections, outputSchema, where, groupBy, aggregates, having, orderBy, limit);
         }
 
         public BoundSelect {
             Objects.requireNonNull(table, "table must not be null");
+            Objects.requireNonNull(joins, "joins must not be null");
             Objects.requireNonNull(projections, "projections must not be null");
             Objects.requireNonNull(outputSchema, "outputSchema must not be null");
             Objects.requireNonNull(groupBy, "groupBy must not be null");
             Objects.requireNonNull(aggregates, "aggregates must not be null");
             Objects.requireNonNull(orderBy, "orderBy must not be null");
+            joins = List.copyOf(joins);
             projections = List.copyOf(projections);
             groupBy = List.copyOf(groupBy);
             aggregates = List.copyOf(aggregates);

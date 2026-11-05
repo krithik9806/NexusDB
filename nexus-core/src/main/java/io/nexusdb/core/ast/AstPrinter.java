@@ -56,6 +56,7 @@ public final class AstPrinter {
             case Statement.SelectStatement(
                     List<SelectItem> items,
                     TableRef from,
+                    List<JoinClause> joins,
                     Expr where,
                     List<Expr> groupBy,
                     Expr having,
@@ -64,6 +65,14 @@ public final class AstPrinter {
                 StringBuilder sb = new StringBuilder("SELECT ");
                 sb.append(items.stream().map(AstPrinter::printSelectItem).collect(Collectors.joining(", ")));
                 sb.append(" FROM ").append(printTableRef(from));
+                for (JoinClause join : joins) {
+                    sb.append(" ")
+                            .append(join.joinType().sql())
+                            .append(" ")
+                            .append(printTableRef(join.rightTable()))
+                            .append(" ON ")
+                            .append(print(join.condition()));
+                }
                 if (where != null) {
                     sb.append(" WHERE ").append(print(where));
                 }

@@ -8,15 +8,19 @@ import io.nexusdb.core.executor.ExecutionPlanner;
 import io.nexusdb.core.executor.Executor;
 import io.nexusdb.core.executor.FilterExecutor;
 import io.nexusdb.core.executor.HashAggregateExecutor;
+import io.nexusdb.core.executor.HashJoinExecutor;
 import io.nexusdb.core.executor.IndexScanExecutor;
 import io.nexusdb.core.executor.InsertExecutor;
 import io.nexusdb.core.executor.LimitExecutor;
+import io.nexusdb.core.executor.NestedLoopJoinExecutor;
 import io.nexusdb.core.executor.ProjectionExecutor;
 import io.nexusdb.core.executor.SeqScanExecutor;
 import io.nexusdb.core.executor.SortExecutor;
 import io.nexusdb.core.executor.UpdateExecutor;
+import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.record.Value;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
@@ -60,7 +64,19 @@ public final class CostBasedPlanner {
     }
 
     private Executor planSelect(BoundStatement.BoundSelect select) {
-        Executor plan = planTableAccess(select.table(), select.where());
+        Executor plan;
+        if (select.joins().isEmpty()) {
+            plan = planTableAccess(select.table(), select.where());
+        } else {
+            plan = planTableAccess(select.table(), null);
+            for (BoundStatement.BoundJoin join : select.joins()) {
+                Executor rightPlan = planTableAccess(join.rightTable(), null);
+                plan = planJoin(plan, rightPlan, join);
+            }
+            if (select.where() != null) {
+                plan = new FilterExecutor(plan, select.where());
+            }
+        }
         if (select.isAggregated()) {
             plan = new HashAggregateExecutor(plan, select.groupBy(), select.aggregates());
             if (select.having() != null) {
@@ -75,6 +91,98 @@ public final class CostBasedPlanner {
             plan = new LimitExecutor(plan, select.limit());
         }
         return plan;
+    }
+
+    private Executor planJoin(Executor leftPlan, Executor rightPlan, BoundStatement.BoundJoin join) {
+        int splitIndex = join.rightStartColumnIndex();
+        int maxIndex = splitIndex + join.rightTable().getSchema().getColumnCount();
+        List<BoundExpr> conjuncts = new ArrayList<>();
+        collectJoinConjuncts(join.condition(), conjuncts);
+
+        List<BoundExpr> leftKeys = new ArrayList<>();
+        List<BoundExpr> rightKeys = new ArrayList<>();
+        List<BoundExpr> residuals = new ArrayList<>();
+
+        for (BoundExpr c : conjuncts) {
+            if (c instanceof BoundExpr.BoundBinaryExpr(
+                    BoundExpr left, Expr.BinaryOp op, BoundExpr right, DataType ignoredType)
+                    && op == Expr.BinaryOp.EQ) {
+                if (referencesOnlyRange(left, 0, splitIndex)
+                        && referencesOnlyRange(right, splitIndex, maxIndex)) {
+                    leftKeys.add(left);
+                    rightKeys.add(right);
+                    continue;
+                }
+                if (referencesOnlyRange(right, 0, splitIndex)
+                        && referencesOnlyRange(left, splitIndex, maxIndex)) {
+                    leftKeys.add(right);
+                    rightKeys.add(left);
+                    continue;
+                }
+            }
+            residuals.add(c);
+        }
+
+        if (!leftKeys.isEmpty()) {
+            BoundExpr residual = null;
+            for (BoundExpr r : residuals) {
+                residual = (residual == null)
+                        ? r
+                        : new BoundExpr.BoundBinaryExpr(residual, Expr.BinaryOp.AND, r, DataType.BOOLEAN);
+            }
+            return new HashJoinExecutor(leftPlan, rightPlan, join.joinType(), leftKeys, rightKeys, residual);
+        }
+        return new NestedLoopJoinExecutor(leftPlan, rightPlan, join.joinType(), join.condition());
+    }
+
+    private static void collectJoinConjuncts(BoundExpr expr, List<BoundExpr> out) {
+        if (expr instanceof BoundExpr.BoundBinaryExpr(
+                BoundExpr left, Expr.BinaryOp op, BoundExpr right, DataType ignored)
+                && op == Expr.BinaryOp.AND) {
+            collectJoinConjuncts(left, out);
+            collectJoinConjuncts(right, out);
+        } else {
+            out.add(expr);
+        }
+    }
+
+    private static boolean referencesOnlyRange(BoundExpr expr, int minInclusive, int maxExclusive) {
+        boolean[] hasCol = {false};
+        boolean[] allInRange = {true};
+        checkColumnRange(expr, minInclusive, maxExclusive, hasCol, allInRange);
+        return hasCol[0] && allInRange[0];
+    }
+
+    private static void checkColumnRange(
+            BoundExpr expr,
+            int minInclusive,
+            int maxExclusive,
+            boolean[] hasCol,
+            boolean[] allInRange) {
+        if (!allInRange[0] || expr == null) {
+            return;
+        }
+        switch (expr) {
+            case BoundExpr.BoundColumnRef(int colIdx, String ignoredName, DataType ignoredType) -> {
+                hasCol[0] = true;
+                if (colIdx < minInclusive || colIdx >= maxExclusive) {
+                    allInRange[0] = false;
+                }
+            }
+            case BoundExpr.BoundLiteral ignored -> {
+            }
+            case BoundExpr.BoundUnaryExpr(var ignoredOp, BoundExpr operand, var ignoredType) ->
+                    checkColumnRange(operand, minInclusive, maxExclusive, hasCol, allInRange);
+            case BoundExpr.BoundBinaryExpr(BoundExpr left, var ignoredOp, BoundExpr right, var ignoredType) -> {
+                checkColumnRange(left, minInclusive, maxExclusive, hasCol, allInRange);
+                checkColumnRange(right, minInclusive, maxExclusive, hasCol, allInRange);
+            }
+            case BoundExpr.BoundIsNullExpr(BoundExpr operand, boolean ignoredNeg) ->
+                    checkColumnRange(operand, minInclusive, maxExclusive, hasCol, allInRange);
+            case BoundExpr.BoundCastExpr(BoundExpr operand, var ignoredType) ->
+                    checkColumnRange(operand, minInclusive, maxExclusive, hasCol, allInRange);
+            case BoundExpr.BoundAggregate ignored -> allInRange[0] = false;
+        }
     }
 
     /**

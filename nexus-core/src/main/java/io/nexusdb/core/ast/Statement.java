@@ -116,11 +116,12 @@ public sealed interface Statement
     }
 
     /**
-     * {@code SELECT <selectItems> FROM <from> [WHERE <where>] [GROUP BY <groupBy>] [HAVING <having>] [ORDER BY <orderBy>] [LIMIT <limit>]}
+     * {@code SELECT <selectItems> FROM <from> [<joins>] [WHERE <where>] [GROUP BY <groupBy>] [HAVING <having>] [ORDER BY <orderBy>] [LIMIT <limit>]}
      */
     record SelectStatement(
             List<SelectItem> selectItems,
             TableRef from,
+            List<JoinClause> joins,
             Expr where,
             List<Expr> groupBy,
             Expr having,
@@ -132,7 +133,18 @@ public sealed interface Statement
                 Expr where,
                 List<OrderByItem> orderBy,
                 Integer limit) {
-            this(selectItems, from, where, List.of(), null, orderBy, limit);
+            this(selectItems, from, List.of(), where, List.of(), null, orderBy, limit);
+        }
+
+        public SelectStatement(
+                List<SelectItem> selectItems,
+                TableRef from,
+                Expr where,
+                List<Expr> groupBy,
+                Expr having,
+                List<OrderByItem> orderBy,
+                Integer limit) {
+            this(selectItems, from, List.of(), where, groupBy, having, orderBy, limit);
         }
 
         public SelectStatement {
@@ -141,12 +153,14 @@ public sealed interface Statement
                 throw new IllegalArgumentException("SELECT list must not be empty");
             }
             Objects.requireNonNull(from, "from must not be null");
+            Objects.requireNonNull(joins, "joins must not be null");
             Objects.requireNonNull(groupBy, "groupBy must not be null");
             Objects.requireNonNull(orderBy, "orderBy must not be null");
             if (limit != null && limit < 0) {
                 throw new IllegalArgumentException("LIMIT must be >= 0, got: " + limit);
             }
             selectItems = List.copyOf(selectItems);
+            joins = List.copyOf(joins);
             groupBy = List.copyOf(groupBy);
             orderBy = List.copyOf(orderBy);
         }
