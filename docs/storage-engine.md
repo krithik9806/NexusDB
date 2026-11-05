@@ -152,8 +152,10 @@ B+Tree indexes (`BPlusTree` / `BPlusTreePage` in `io.nexusdb.core.index`) store 
   - `rightChildPageId` (`int`, 4 B)
   - `sepRecordPageId` (`int`, 4 B) + `sepRecordSlotId` (`int`, 4 B)
   - `nullFlag` (`byte`, 1 B) + `keyPayload`
-- **Ordering & Concurrency**:
+- **Ordering, Rebalancing & Concurrency**:
   - Unique indexes order entries by `Value` key; non-unique indexes order both leaf entries and internal separators by composite `(Value key, RecordId recordId)`.
+  - On deletion (`BPlusTree.delete` / `deleteKey`), underflowing non-root nodes first attempt to borrow (redistribute) an entry from an adjacent left or right sibling (updating or rotating through the parent separator), or merge into the left page and free the right page via `BufferPoolManager.deletePage`. When an internal root loses its last separator key (`keyCount == 0`), its single child is copied into `rootPageId` and freed, shrinking the tree while keeping `rootPageId` constant.
+  - Range scans (`BPlusTree.rangeScan`) descend to the lower-bound leaf and walk `nextLeafPageId` links one page at a time without holding page pins across caller iterations.
   - Tree-level concurrency is guarded by a `ReentrantReadWriteLock` (`treeLock`) paired with per-page `rlatch()`/`wlatch()` latches, pinning at most one buffer pool page at any instant.
 
 

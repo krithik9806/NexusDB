@@ -20,8 +20,9 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <ul>
  *   <li><b>Stable Root Page ID</b>: {@link #getRootPageId()} remains constant for the lifetime of the
  *       index. When the root page splits, two new child pages are allocated for the left and right halves
- *       and the root page is rewritten in-place as the new internal root, so external catalog references
- *       never become stale across root splits or root collapses.</li>
+ *       and the root page is rewritten in-place as the new internal root; when an internal root loses its
+ *       last separator key during deletion, its single remaining child is copied into {@code rootPageId}
+ *       and deallocated. External catalog references therefore never become stale across splits or shrinks.</li>
  *   <li><b>Composite Ordering for Non-Unique Indexes</b>: Unique indexes order entries strictly by
  *       {@link Value} key and reject conflicting {@link RecordId}s with {@link DuplicateKeyException}.
  *       Non-unique indexes order both leaf entries and internal separator keys by the composite pair
@@ -30,12 +31,13 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *   <li><b>Concurrency Protocol</b>: Tree-level structure mutations and traversals are coordinated by a
  *       {@link ReentrantReadWriteLock} ({@code treeLock}), while individual page accesses acquire per-page
  *       {@link Page#rlatch()}/{@link Page#wlatch()} latches. At most one buffer pool frame is pinned at
- *       any instant during search, insert, and split propagation, preventing buffer pool pin exhaustion.</li>
+ *       any instant during search, range scan, insert, and delete/merge propagation.</li>
  * </ul>
  */
 public final class BPlusTree {
     public static final int DEFAULT_MAX_KEYS = Integer.MAX_VALUE;
     private static final RecordId MIN_RECORD_ID = new RecordId(0, 0);
+    private static final RecordId MAX_RECORD_ID = new RecordId(Integer.MAX_VALUE, Integer.MAX_VALUE);
 
     private final BufferPoolManager bufferPoolManager;
     private final int rootPageId;
@@ -207,7 +209,6 @@ public final class BPlusTree {
                     }
 
                     if (startIdx == count) {
-                        // Match could start at index 0 of the next leaf if separator fell at boundary
                         nextLeafPageId = leaf.getNextLeafPageId();
                         keepScanning = (nextLeafPageId != -1);
                     } else {
@@ -239,6 +240,120 @@ public final class BPlusTree {
             return results;
         } finally {
             treeLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Returns a forward {@link BPlusTreeRangeIterator} over entries matching the specified range bounds.
+     * Passing {@code null} for {@code lowKey} or {@code highKey} leaves that side of the range unbounded.
+     */
+    public BPlusTreeRangeIterator rangeScan(
+            Value lowKey,
+            boolean lowInclusive,
+            Value highKey,
+            boolean highInclusive) {
+        if (lowKey != null) {
+            validateKey(lowKey);
+        }
+        if (highKey != null) {
+            validateKey(highKey);
+        }
+        if (lowKey != null && highKey != null) {
+            int boundCmp = lowKey.compareTo(highKey);
+            if (boundCmp > 0 || (boundCmp == 0 && (!lowInclusive || !highInclusive))) {
+                return new BPlusTreeRangeIterator(this, -1, lowKey, lowInclusive, highKey, highInclusive);
+            }
+        }
+
+        int startLeafPageId;
+        treeLock.readLock().lock();
+        try {
+            if (lowKey == null) {
+                startLeafPageId = findLeftmostLeafPageId();
+            } else {
+                RecordId probeRid = lowInclusive ? MIN_RECORD_ID : MAX_RECORD_ID;
+                startLeafPageId = findLeafPageId(lowKey, probeRid);
+            }
+        } finally {
+            treeLock.readLock().unlock();
+        }
+        return new BPlusTreeRangeIterator(this, startLeafPageId, lowKey, lowInclusive, highKey, highInclusive);
+    }
+
+    int readRangeLeafBatch(
+            int leafPageId,
+            boolean firstLeaf,
+            Value lowKey,
+            boolean lowInclusive,
+            Value highKey,
+            boolean highInclusive,
+            List<IndexEntry> outBatch) {
+        treeLock.readLock().lock();
+        try {
+            Page page = bufferPoolManager.fetchPage(leafPageId);
+            page.rlatch();
+            try {
+                BPlusTreePage leaf = BPlusTreePage.wrap(page);
+                if (!leaf.isLeaf()) {
+                    return -1;
+                }
+                int count = leaf.getKeyCount();
+                int startIdx = 0;
+
+                if (firstLeaf && lowKey != null) {
+                    RecordId probeRid = lowInclusive ? MIN_RECORD_ID : MAX_RECORD_ID;
+                    int bs = leaf.binarySearch(lowKey, probeRid, !unique);
+                    if (bs >= 0) {
+                        startIdx = lowInclusive ? bs : (bs + 1);
+                    } else {
+                        startIdx = -bs - 1;
+                    }
+                }
+
+                for (int i = startIdx; i < count; i++) {
+                    if (lowKey != null) {
+                        int lowCmp = leaf.compareEntryAt(i, lowKey, 0, 0, false);
+                        if (lowCmp < 0 || (lowCmp == 0 && !lowInclusive)) {
+                            continue;
+                        }
+                    }
+                    if (highKey != null) {
+                        int highCmp = leaf.compareEntryAt(i, highKey, 0, 0, false);
+                        if (highCmp > 0 || (highCmp == 0 && !highInclusive)) {
+                            return -1;
+                        }
+                    }
+                    outBatch.add(leaf.getLeafEntry(i));
+                }
+                return leaf.getNextLeafPageId();
+            } finally {
+                page.runlatch();
+                bufferPoolManager.unpinPage(leafPageId, false);
+            }
+        } finally {
+            treeLock.readLock().unlock();
+        }
+    }
+
+    private int findLeftmostLeafPageId() {
+        int currPageId = rootPageId;
+        while (true) {
+            Page page = bufferPoolManager.fetchPage(currPageId);
+            page.rlatch();
+            boolean isLeaf;
+            int firstChild;
+            try {
+                BPlusTreePage node = BPlusTreePage.wrap(page);
+                isLeaf = node.isLeaf();
+                firstChild = node.getFirstChildPageId();
+            } finally {
+                page.runlatch();
+                bufferPoolManager.unpinPage(currPageId, false);
+            }
+            if (isLeaf) {
+                return currPageId;
+            }
+            currPageId = firstChild;
         }
     }
 
@@ -307,7 +422,6 @@ public final class BPlusTree {
                 return;
             }
 
-            // Propagate split upward along ancestor internal nodes
             for (int level = pathPageIds.size() - 2; level >= 0; level--) {
                 int internalPageId = pathPageIds.get(level);
                 splitResult = insertIntoInternal(internalPageId, splitResult);
@@ -318,6 +432,727 @@ public final class BPlusTree {
         } finally {
             treeLock.writeLock().unlock();
         }
+    }
+
+    /**
+     * Deletes all entries associated with {@code key} from the B+Tree.
+     *
+     * @return the number of removed entries
+     */
+    public int deleteKey(Value key) {
+        validateKey(key);
+        List<RecordId> rids = search(key);
+        int removed = 0;
+        for (RecordId rid : rids) {
+            if (delete(key, rid)) {
+                removed++;
+            }
+        }
+        return removed;
+    }
+
+    /**
+     * Deletes the specific {@code (key, recordId)} entry from the B+Tree, handling node underflow
+     * via left/right sibling redistribution (borrow) or sibling merge and shrinking the root when
+     * an internal root is reduced to a single child.
+     *
+     * @return {@code true} if the entry existed and was deleted, {@code false} otherwise
+     */
+    public boolean delete(Value key, RecordId recordId) {
+        validateKey(key);
+        Objects.requireNonNull(recordId, "recordId must not be null");
+
+        treeLock.writeLock().lock();
+        try {
+            List<Integer> pathPageIds = new ArrayList<>(8);
+            List<Integer> pathChildIndices = new ArrayList<>(8);
+            int currPageId = rootPageId;
+
+            while (true) {
+                pathPageIds.add(currPageId);
+                Page page = bufferPoolManager.fetchPage(currPageId);
+                page.rlatch();
+                boolean isLeaf;
+                int childIdx = -1;
+                int nextPageId = -1;
+                try {
+                    BPlusTreePage node = BPlusTreePage.wrap(page);
+                    isLeaf = node.isLeaf();
+                    if (!isLeaf) {
+                        childIdx = node.findChildIndex(key, recordId, !unique);
+                        nextPageId = node.getChildPageId(childIdx);
+                    }
+                } finally {
+                    page.runlatch();
+                    bufferPoolManager.unpinPage(currPageId, false);
+                }
+                if (isLeaf) {
+                    break;
+                }
+                pathChildIndices.add(childIdx);
+                currPageId = nextPageId;
+            }
+
+            int leafPageId = pathPageIds.get(pathPageIds.size() - 1);
+            boolean leafUnderflow;
+
+            Page leafPage = bufferPoolManager.fetchPage(leafPageId);
+            leafPage.wlatch();
+            try {
+                BPlusTreePage leaf = BPlusTreePage.wrap(leafPage);
+                int bs = leaf.binarySearch(key, recordId, !unique);
+                if (bs < 0 || !leaf.getRecordId(bs).equals(recordId)) {
+                    leafPage.wunlatch();
+                    bufferPoolManager.unpinPage(leafPageId, false);
+                    return false;
+                }
+                leaf.removeAt(bs);
+                leafUnderflow = (leafPageId != rootPageId) && isNodeUnderflow(leaf);
+            } catch (RuntimeException e) {
+                leafPage.wunlatch();
+                bufferPoolManager.unpinPage(leafPageId, false);
+                throw e;
+            }
+            leafPage.wunlatch();
+            bufferPoolManager.unpinPage(leafPageId, true);
+
+            if (!leafUnderflow) {
+                return true;
+            }
+
+            for (int level = pathPageIds.size() - 1; level >= 1; level--) {
+                int childPageId = pathPageIds.get(level);
+                int parentPageId = pathPageIds.get(level - 1);
+                int childIdx = pathChildIndices.get(level - 1);
+                boolean parentUnderflow = rebalanceUnderflowChild(parentPageId, childIdx, childPageId);
+                if (!parentUnderflow) {
+                    break;
+                }
+            }
+            return true;
+        } finally {
+            treeLock.writeLock().unlock();
+        }
+    }
+
+    private boolean isNodeUnderflow(BPlusTreePage node) {
+        int count = node.getKeyCount();
+        if (count == 0) {
+            return true;
+        }
+        if (maxKeys < DEFAULT_MAX_KEYS) {
+            int minKeys = Math.max(1, maxKeys / 2);
+            return count < minKeys;
+        }
+        int minBytes = node.getMaxPayloadBytes() / 3;
+        return node.getUsedBytes() < minBytes;
+    }
+
+    private boolean canSiblingLend(BPlusTreePage sibling, int removedEntryTotalBytes) {
+        int count = sibling.getKeyCount();
+        if (count <= 1) {
+            return false;
+        }
+        if (maxKeys < DEFAULT_MAX_KEYS) {
+            int minKeys = Math.max(1, maxKeys / 2);
+            return (count - 1) >= minKeys;
+        }
+        int minBytes = sibling.getMaxPayloadBytes() / 3;
+        return (sibling.getUsedBytes() - removedEntryTotalBytes) >= minBytes;
+    }
+
+    private boolean rebalanceUnderflowChild(int parentPageId, int childIdx, int childPageId) {
+        boolean childIsLeaf;
+        Page childProbe = bufferPoolManager.fetchPage(childPageId);
+        childProbe.rlatch();
+        try {
+            BPlusTreePage childNode = BPlusTreePage.wrap(childProbe);
+            if (!isNodeUnderflow(childNode)) {
+                return false;
+            }
+            childIsLeaf = childNode.isLeaf();
+        } finally {
+            childProbe.runlatch();
+            bufferPoolManager.unpinPage(childPageId, false);
+        }
+
+        int parentKeyCount;
+        int leftSiblingPageId = -1;
+        int rightSiblingPageId = -1;
+
+        Page parentProbe = bufferPoolManager.fetchPage(parentPageId);
+        parentProbe.rlatch();
+        try {
+            BPlusTreePage parentNode = BPlusTreePage.wrap(parentProbe);
+            parentKeyCount = parentNode.getKeyCount();
+            if (childIdx > 0) {
+                leftSiblingPageId = parentNode.getChildPageId(childIdx - 1);
+            }
+            if (childIdx < parentKeyCount) {
+                rightSiblingPageId = parentNode.getChildPageId(childIdx + 1);
+            }
+        } finally {
+            parentProbe.runlatch();
+            bufferPoolManager.unpinPage(parentPageId, false);
+        }
+
+        if (childIsLeaf) {
+            if (leftSiblingPageId != -1 && tryBorrowLeafFromLeft(parentPageId, childIdx - 1, leftSiblingPageId, childPageId)) {
+                return false;
+            }
+            if (rightSiblingPageId != -1 && tryBorrowLeafFromRight(parentPageId, childIdx, childPageId, rightSiblingPageId)) {
+                return false;
+            }
+            if (leftSiblingPageId != -1 && canMergeLeaf(leftSiblingPageId, childPageId)) {
+                return mergeLeafNodes(parentPageId, childIdx - 1, leftSiblingPageId, childPageId);
+            }
+            if (rightSiblingPageId != -1 && canMergeLeaf(childPageId, rightSiblingPageId)) {
+                return mergeLeafNodes(parentPageId, childIdx, childPageId, rightSiblingPageId);
+            }
+            return false;
+        } else {
+            if (leftSiblingPageId != -1 && tryBorrowInternalFromLeft(parentPageId, childIdx - 1, leftSiblingPageId, childPageId)) {
+                return false;
+            }
+            if (rightSiblingPageId != -1 && tryBorrowInternalFromRight(parentPageId, childIdx, childPageId, rightSiblingPageId)) {
+                return false;
+            }
+            if (leftSiblingPageId != -1 && canMergeInternal(parentPageId, childIdx - 1, leftSiblingPageId, childPageId)) {
+                return mergeInternalNodes(parentPageId, childIdx - 1, leftSiblingPageId, childPageId);
+            }
+            if (rightSiblingPageId != -1 && canMergeInternal(parentPageId, childIdx, childPageId, rightSiblingPageId)) {
+                return mergeInternalNodes(parentPageId, childIdx, childPageId, rightSiblingPageId);
+            }
+            return false;
+        }
+    }
+
+    private boolean canMergeLeaf(int leftPageId, int rightPageId) {
+        int leftCount;
+        int leftUsed;
+        int maxPayload;
+        Page leftPage = bufferPoolManager.fetchPage(leftPageId);
+        leftPage.rlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftPage);
+            leftCount = left.getKeyCount();
+            leftUsed = left.getUsedBytes();
+            maxPayload = left.getMaxPayloadBytes();
+        } finally {
+            leftPage.runlatch();
+            bufferPoolManager.unpinPage(leftPageId, false);
+        }
+
+        int rightCount;
+        int rightUsed;
+        Page rightPage = bufferPoolManager.fetchPage(rightPageId);
+        rightPage.rlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightPage);
+            rightCount = right.getKeyCount();
+            rightUsed = right.getUsedBytes();
+        } finally {
+            rightPage.runlatch();
+            bufferPoolManager.unpinPage(rightPageId, false);
+        }
+
+        return (long) leftCount + rightCount <= maxKeys && (leftUsed + rightUsed) <= maxPayload;
+    }
+
+    private boolean canMergeInternal(int parentPageId, int sepIdx, int leftPageId, int rightPageId) {
+        int sepBytes;
+        Page parentPage = bufferPoolManager.fetchPage(parentPageId);
+        parentPage.rlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentPage);
+            Value sepKey = parent.getKey(sepIdx);
+            sepBytes = BPlusTreePage.SLOT_SIZE + BPlusTreePage.internalEntryPayloadBytes(sepKey);
+        } finally {
+            parentPage.runlatch();
+            bufferPoolManager.unpinPage(parentPageId, false);
+        }
+
+        int leftCount;
+        int leftUsed;
+        int maxPayload;
+        Page leftPage = bufferPoolManager.fetchPage(leftPageId);
+        leftPage.rlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftPage);
+            leftCount = left.getKeyCount();
+            leftUsed = left.getUsedBytes();
+            maxPayload = left.getMaxPayloadBytes();
+        } finally {
+            leftPage.runlatch();
+            bufferPoolManager.unpinPage(leftPageId, false);
+        }
+
+        int rightCount;
+        int rightUsed;
+        Page rightPage = bufferPoolManager.fetchPage(rightPageId);
+        rightPage.rlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightPage);
+            rightCount = right.getKeyCount();
+            rightUsed = right.getUsedBytes();
+        } finally {
+            rightPage.runlatch();
+            bufferPoolManager.unpinPage(rightPageId, false);
+        }
+
+        return (long) leftCount + 1 + rightCount <= maxKeys && (leftUsed + sepBytes + rightUsed) <= maxPayload;
+    }
+
+    private boolean tryBorrowLeafFromLeft(int parentPageId, int sepIdx, int leftPageId, int childPageId) {
+        IndexEntry candidate;
+        Page leftPage = bufferPoolManager.fetchPage(leftPageId);
+        leftPage.rlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftPage);
+            int count = left.getKeyCount();
+            if (count <= 1) {
+                return false;
+            }
+            candidate = left.getLeafEntry(count - 1);
+            int entryBytes = BPlusTreePage.SLOT_SIZE + BPlusTreePage.leafEntryPayloadBytes(candidate.key());
+            if (!canSiblingLend(left, entryBytes)) {
+                return false;
+            }
+        } finally {
+            leftPage.runlatch();
+            bufferPoolManager.unpinPage(leftPageId, false);
+        }
+
+        Page childPage = bufferPoolManager.fetchPage(childPageId);
+        childPage.rlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childPage);
+            if (child.getKeyCount() >= maxKeys || !child.canFitLeafEntry(candidate.key())) {
+                return false;
+            }
+        } finally {
+            childPage.runlatch();
+            bufferPoolManager.unpinPage(childPageId, false);
+        }
+
+        Page parentPage = bufferPoolManager.fetchPage(parentPageId);
+        parentPage.rlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentPage);
+            if (!parent.canReplaceInternalKeyAt(sepIdx, candidate.key())) {
+                return false;
+            }
+        } finally {
+            parentPage.runlatch();
+            bufferPoolManager.unpinPage(parentPageId, false);
+        }
+
+        // Execute leaf borrow from left sibling
+        Page leftMut = bufferPoolManager.fetchPage(leftPageId);
+        leftMut.wlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftMut);
+            left.removeAt(left.getKeyCount() - 1);
+        } finally {
+            leftMut.wunlatch();
+            bufferPoolManager.unpinPage(leftPageId, true);
+        }
+
+        Page childMut = bufferPoolManager.fetchPage(childPageId);
+        childMut.wlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childMut);
+            child.insertLeafAt(0, candidate.key(), candidate.recordId());
+        } finally {
+            childMut.wunlatch();
+            bufferPoolManager.unpinPage(childPageId, true);
+        }
+
+        Page parentMut = bufferPoolManager.fetchPage(parentPageId);
+        parentMut.wlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
+            parent.setInternalKeyAt(sepIdx, candidate.key(), candidate.recordId());
+        } finally {
+            parentMut.wunlatch();
+            bufferPoolManager.unpinPage(parentPageId, true);
+        }
+        return true;
+    }
+
+    private boolean tryBorrowLeafFromRight(int parentPageId, int sepIdx, int childPageId, int rightPageId) {
+        IndexEntry candidate;
+        IndexEntry newRightMin;
+        Page rightPage = bufferPoolManager.fetchPage(rightPageId);
+        rightPage.rlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightPage);
+            int count = right.getKeyCount();
+            if (count <= 1) {
+                return false;
+            }
+            candidate = right.getLeafEntry(0);
+            newRightMin = right.getLeafEntry(1);
+            int entryBytes = BPlusTreePage.SLOT_SIZE + BPlusTreePage.leafEntryPayloadBytes(candidate.key());
+            if (!canSiblingLend(right, entryBytes)) {
+                return false;
+            }
+        } finally {
+            rightPage.runlatch();
+            bufferPoolManager.unpinPage(rightPageId, false);
+        }
+
+        Page childPage = bufferPoolManager.fetchPage(childPageId);
+        childPage.rlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childPage);
+            if (child.getKeyCount() >= maxKeys || !child.canFitLeafEntry(candidate.key())) {
+                return false;
+            }
+        } finally {
+            childPage.runlatch();
+            bufferPoolManager.unpinPage(childPageId, false);
+        }
+
+        Page parentPage = bufferPoolManager.fetchPage(parentPageId);
+        parentPage.rlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentPage);
+            if (!parent.canReplaceInternalKeyAt(sepIdx, newRightMin.key())) {
+                return false;
+            }
+        } finally {
+            parentPage.runlatch();
+            bufferPoolManager.unpinPage(parentPageId, false);
+        }
+
+        // Execute leaf borrow from right sibling
+        Page rightMut = bufferPoolManager.fetchPage(rightPageId);
+        rightMut.wlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightMut);
+            right.removeAt(0);
+        } finally {
+            rightMut.wunlatch();
+            bufferPoolManager.unpinPage(rightPageId, true);
+        }
+
+        Page childMut = bufferPoolManager.fetchPage(childPageId);
+        childMut.wlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childMut);
+            child.insertLeafAt(child.getKeyCount(), candidate.key(), candidate.recordId());
+        } finally {
+            childMut.wunlatch();
+            bufferPoolManager.unpinPage(childPageId, true);
+        }
+
+        Page parentMut = bufferPoolManager.fetchPage(parentPageId);
+        parentMut.wlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
+            parent.setInternalKeyAt(sepIdx, newRightMin.key(), newRightMin.recordId());
+        } finally {
+            parentMut.wunlatch();
+            bufferPoolManager.unpinPage(parentPageId, true);
+        }
+        return true;
+    }
+
+    private boolean mergeLeafNodes(int parentPageId, int sepIdx, int leftPageId, int rightPageId) {
+        List<IndexEntry> rightEntries;
+        int rightNextLeaf;
+
+        Page rightPage = bufferPoolManager.fetchPage(rightPageId);
+        rightPage.rlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightPage);
+            rightEntries = right.getAllLeafEntries();
+            rightNextLeaf = right.getNextLeafPageId();
+        } finally {
+            rightPage.runlatch();
+            bufferPoolManager.unpinPage(rightPageId, false);
+        }
+
+        Page leftPage = bufferPoolManager.fetchPage(leftPageId);
+        leftPage.wlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftPage);
+            for (IndexEntry entry : rightEntries) {
+                left.insertLeafAt(left.getKeyCount(), entry.key(), entry.recordId());
+            }
+            left.setNextLeafPageId(rightNextLeaf);
+        } finally {
+            leftPage.wunlatch();
+            bufferPoolManager.unpinPage(leftPageId, true);
+        }
+
+        if (rightNextLeaf != -1) {
+            Page nextLeafPage = bufferPoolManager.fetchPage(rightNextLeaf);
+            nextLeafPage.wlatch();
+            try {
+                BPlusTreePage.wrap(nextLeafPage).setPrevLeafPageId(leftPageId);
+            } finally {
+                nextLeafPage.wunlatch();
+                bufferPoolManager.unpinPage(rightNextLeaf, true);
+            }
+        }
+
+        bufferPoolManager.deletePage(rightPageId);
+        return removeSeparatorFromParent(parentPageId, sepIdx, leftPageId);
+    }
+
+    private boolean tryBorrowInternalFromLeft(int parentPageId, int sepIdx, int leftPageId, int childPageId) {
+        BPlusTreePage.InternalEntry lastLeft;
+        Page leftPage = bufferPoolManager.fetchPage(leftPageId);
+        leftPage.rlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftPage);
+            int count = left.getKeyCount();
+            if (count <= 1) {
+                return false;
+            }
+            lastLeft = left.getInternalEntry(count - 1);
+            int entryBytes = BPlusTreePage.SLOT_SIZE + BPlusTreePage.internalEntryPayloadBytes(lastLeft.key());
+            if (!canSiblingLend(left, entryBytes)) {
+                return false;
+            }
+        } finally {
+            leftPage.runlatch();
+            bufferPoolManager.unpinPage(leftPageId, false);
+        }
+
+        BPlusTreePage.InternalEntry parentSep;
+        Page parentPage = bufferPoolManager.fetchPage(parentPageId);
+        parentPage.rlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentPage);
+            parentSep = parent.getInternalEntry(sepIdx);
+            if (!parent.canReplaceInternalKeyAt(sepIdx, lastLeft.key())) {
+                return false;
+            }
+        } finally {
+            parentPage.runlatch();
+            bufferPoolManager.unpinPage(parentPageId, false);
+        }
+
+        Page childPage = bufferPoolManager.fetchPage(childPageId);
+        childPage.rlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childPage);
+            if (child.getKeyCount() >= maxKeys || !child.canFitInternalEntry(parentSep.key())) {
+                return false;
+            }
+        } finally {
+            childPage.runlatch();
+            bufferPoolManager.unpinPage(childPageId, false);
+        }
+
+        // Execute internal rotation from left sibling through parent
+        Page leftMut = bufferPoolManager.fetchPage(leftPageId);
+        leftMut.wlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftMut);
+            left.removeAt(left.getKeyCount() - 1);
+        } finally {
+            leftMut.wunlatch();
+            bufferPoolManager.unpinPage(leftPageId, true);
+        }
+
+        Page childMut = bufferPoolManager.fetchPage(childPageId);
+        childMut.wlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childMut);
+            int oldFirstChild = child.getFirstChildPageId();
+            child.setFirstChildPageId(lastLeft.rightChildPageId());
+            child.insertInternalAt(0, parentSep.key(), parentSep.recordId(), oldFirstChild);
+        } finally {
+            childMut.wunlatch();
+            bufferPoolManager.unpinPage(childPageId, true);
+        }
+
+        Page parentMut = bufferPoolManager.fetchPage(parentPageId);
+        parentMut.wlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
+            parent.setInternalKeyAt(sepIdx, lastLeft.key(), lastLeft.recordId());
+        } finally {
+            parentMut.wunlatch();
+            bufferPoolManager.unpinPage(parentPageId, true);
+        }
+        return true;
+    }
+
+    private boolean tryBorrowInternalFromRight(int parentPageId, int sepIdx, int childPageId, int rightPageId) {
+        BPlusTreePage.InternalEntry firstRight;
+        int rightFirstChild;
+        Page rightPage = bufferPoolManager.fetchPage(rightPageId);
+        rightPage.rlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightPage);
+            int count = right.getKeyCount();
+            if (count <= 1) {
+                return false;
+            }
+            firstRight = right.getInternalEntry(0);
+            rightFirstChild = right.getFirstChildPageId();
+            int entryBytes = BPlusTreePage.SLOT_SIZE + BPlusTreePage.internalEntryPayloadBytes(firstRight.key());
+            if (!canSiblingLend(right, entryBytes)) {
+                return false;
+            }
+        } finally {
+            rightPage.runlatch();
+            bufferPoolManager.unpinPage(rightPageId, false);
+        }
+
+        BPlusTreePage.InternalEntry parentSep;
+        Page parentPage = bufferPoolManager.fetchPage(parentPageId);
+        parentPage.rlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentPage);
+            parentSep = parent.getInternalEntry(sepIdx);
+            if (!parent.canReplaceInternalKeyAt(sepIdx, firstRight.key())) {
+                return false;
+            }
+        } finally {
+            parentPage.runlatch();
+            bufferPoolManager.unpinPage(parentPageId, false);
+        }
+
+        Page childPage = bufferPoolManager.fetchPage(childPageId);
+        childPage.rlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childPage);
+            if (child.getKeyCount() >= maxKeys || !child.canFitInternalEntry(parentSep.key())) {
+                return false;
+            }
+        } finally {
+            childPage.runlatch();
+            bufferPoolManager.unpinPage(childPageId, false);
+        }
+
+        // Execute internal rotation from right sibling through parent
+        Page rightMut = bufferPoolManager.fetchPage(rightPageId);
+        rightMut.wlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightMut);
+            right.removeAt(0);
+            right.setFirstChildPageId(firstRight.rightChildPageId());
+        } finally {
+            rightMut.wunlatch();
+            bufferPoolManager.unpinPage(rightPageId, true);
+        }
+
+        Page childMut = bufferPoolManager.fetchPage(childPageId);
+        childMut.wlatch();
+        try {
+            BPlusTreePage child = BPlusTreePage.wrap(childMut);
+            child.insertInternalAt(child.getKeyCount(), parentSep.key(), parentSep.recordId(), rightFirstChild);
+        } finally {
+            childMut.wunlatch();
+            bufferPoolManager.unpinPage(childPageId, true);
+        }
+
+        Page parentMut = bufferPoolManager.fetchPage(parentPageId);
+        parentMut.wlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentMut);
+            parent.setInternalKeyAt(sepIdx, firstRight.key(), firstRight.recordId());
+        } finally {
+            parentMut.wunlatch();
+            bufferPoolManager.unpinPage(parentPageId, true);
+        }
+        return true;
+    }
+
+    private boolean mergeInternalNodes(int parentPageId, int sepIdx, int leftPageId, int rightPageId) {
+        BPlusTreePage.InternalEntry parentSep;
+        Page parentProbe = bufferPoolManager.fetchPage(parentPageId);
+        parentProbe.rlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentProbe);
+            parentSep = parent.getInternalEntry(sepIdx);
+        } finally {
+            parentProbe.runlatch();
+            bufferPoolManager.unpinPage(parentPageId, false);
+        }
+
+        int rightFirstChild;
+        List<BPlusTreePage.InternalEntry> rightEntries;
+        Page rightPage = bufferPoolManager.fetchPage(rightPageId);
+        rightPage.rlatch();
+        try {
+            BPlusTreePage right = BPlusTreePage.wrap(rightPage);
+            rightFirstChild = right.getFirstChildPageId();
+            rightEntries = right.getAllInternalEntries();
+        } finally {
+            rightPage.runlatch();
+            bufferPoolManager.unpinPage(rightPageId, false);
+        }
+
+        Page leftPage = bufferPoolManager.fetchPage(leftPageId);
+        leftPage.wlatch();
+        try {
+            BPlusTreePage left = BPlusTreePage.wrap(leftPage);
+            left.insertInternalAt(left.getKeyCount(), parentSep.key(), parentSep.recordId(), rightFirstChild);
+            for (BPlusTreePage.InternalEntry entry : rightEntries) {
+                left.insertInternalAt(left.getKeyCount(), entry.key(), entry.recordId(), entry.rightChildPageId());
+            }
+        } finally {
+            leftPage.wunlatch();
+            bufferPoolManager.unpinPage(leftPageId, true);
+        }
+
+        bufferPoolManager.deletePage(rightPageId);
+        return removeSeparatorFromParent(parentPageId, sepIdx, leftPageId);
+    }
+
+    private boolean removeSeparatorFromParent(int parentPageId, int sepIdx, int mergedChildPageId) {
+        boolean collapseRoot = false;
+        boolean parentUnderflow = false;
+
+        Page parentPage = bufferPoolManager.fetchPage(parentPageId);
+        parentPage.wlatch();
+        try {
+            BPlusTreePage parent = BPlusTreePage.wrap(parentPage);
+            parent.removeAt(sepIdx);
+            if (parentPageId == rootPageId) {
+                collapseRoot = (parent.getKeyCount() == 0);
+            } else {
+                parentUnderflow = isNodeUnderflow(parent);
+            }
+        } finally {
+            parentPage.wunlatch();
+            bufferPoolManager.unpinPage(parentPageId, true);
+        }
+
+        if (collapseRoot) {
+            byte[] childSnapshot = new byte[bufferPoolManager.getDiskManager().getPageSize()];
+            Page childPage = bufferPoolManager.fetchPage(mergedChildPageId);
+            childPage.rlatch();
+            try {
+                System.arraycopy(childPage.getData(), 0, childSnapshot, 0, childSnapshot.length);
+            } finally {
+                childPage.runlatch();
+                bufferPoolManager.unpinPage(mergedChildPageId, false);
+            }
+
+            Page rootPage = bufferPoolManager.fetchPage(rootPageId);
+            rootPage.wlatch();
+            try {
+                BPlusTreePage rootNode = BPlusTreePage.wrap(rootPage);
+                BPlusTreePage snapshotNode = BPlusTreePage.wrap(new Page(mergedChildPageId, childSnapshot));
+                rootNode.copyNodeContentsFrom(snapshotNode);
+            } finally {
+                rootPage.wunlatch();
+                bufferPoolManager.unpinPage(rootPageId, true);
+            }
+
+            bufferPoolManager.deletePage(mergedChildPageId);
+            return false;
+        }
+
+        return parentUnderflow;
     }
 
     private record SplitResult(Value promotedKey, RecordId promotedRecordId, int rightPageId) {}
@@ -339,7 +1174,6 @@ public final class BPlusTree {
                             "Duplicate key '" + key + "' in unique index (existing RecordId="
                                     + existingRid + ", new RecordId=" + recordId + ")");
                 }
-                // Idempotent duplicate of exact (key, recordId)
                 leafPage.wunlatch();
                 bufferPoolManager.unpinPage(leafPageId, false);
                 return null;
@@ -371,7 +1205,6 @@ public final class BPlusTree {
         IndexEntry promoted = rightEntries.get(0);
 
         if (leafPageId == rootPageId) {
-            // Root leaf split: allocate two child leaf pages and convert rootPageId into an internal root
             Page leftChildRaw = bufferPoolManager.newPage();
             int leftChildPageId = leftChildRaw.getPageId();
             leftChildRaw.wlatch();
@@ -419,7 +1252,6 @@ public final class BPlusTree {
             return null;
         }
 
-        // Non-root leaf split: allocate right sibling leaf and link leaf sibling pointers
         Page rightRaw = bufferPoolManager.newPage();
         int rightLeafPageId = rightRaw.getPageId();
         rightRaw.wlatch();
@@ -499,7 +1331,6 @@ public final class BPlusTree {
         int rightFirstChildPageId = pushedUp.rightChildPageId();
 
         if (internalPageId == rootPageId) {
-            // Internal root split: allocate left and right internal children and rewrite rootPageId
             Page leftRaw = bufferPoolManager.newPage();
             int leftInternalPageId = leftRaw.getPageId();
             leftRaw.wlatch();
@@ -534,7 +1365,6 @@ public final class BPlusTree {
             return null;
         }
 
-        // Non-root internal split
         Page leftUpdate = bufferPoolManager.fetchPage(internalPageId);
         leftUpdate.wlatch();
         try {
@@ -557,6 +1387,44 @@ public final class BPlusTree {
         }
 
         return new SplitResult(pushedUp.key(), pushedUp.recordId(), rightInternalPageId);
+    }
+
+    /**
+     * Deallocates all pages belonging to this B+Tree and returns them to the buffer pool's page allocator.
+     */
+    public void freeAllPages() {
+        treeLock.writeLock().lock();
+        try {
+            List<Integer> allPages = new ArrayList<>();
+            collectPagesPostOrder(rootPageId, allPages);
+            for (int pageId : allPages) {
+                bufferPoolManager.deletePage(pageId);
+            }
+        } finally {
+            treeLock.writeLock().unlock();
+        }
+    }
+
+    private void collectPagesPostOrder(int pageId, List<Integer> collected) {
+        List<Integer> children = new ArrayList<>();
+        Page page = bufferPoolManager.fetchPage(pageId);
+        page.rlatch();
+        try {
+            BPlusTreePage node = BPlusTreePage.wrap(page);
+            if (node.isInternal()) {
+                int count = node.getKeyCount();
+                for (int i = 0; i <= count; i++) {
+                    children.add(node.getChildPageId(i));
+                }
+            }
+        } finally {
+            page.runlatch();
+            bufferPoolManager.unpinPage(pageId, false);
+        }
+        for (int childId : children) {
+            collectPagesPostOrder(childId, collected);
+        }
+        collected.add(pageId);
     }
 
     /**
@@ -747,7 +1615,6 @@ public final class BPlusTree {
             return;
         }
 
-        // Internal node checks
         if (keyCount == 0) {
             throw new IllegalStateException("Internal node " + pageId + " has 0 keys");
         }
@@ -773,7 +1640,6 @@ public final class BPlusTree {
             checkBounds(pageId, curr.key(), curr.recordId(), lowerBound, upperBound);
         }
 
-        // Verify children recursively with tightened [lowerBound, upperBound) intervals
         IndexEntry firstSep = new IndexEntry(internalEntries.get(0).key(), internalEntries.get(0).recordId());
         verifySubtree(firstChild, depth + 1, lowerBound, firstSep, visitedPages, leavesInTreeOrder, expectedLeafDepth);
 

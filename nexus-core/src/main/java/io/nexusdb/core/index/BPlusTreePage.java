@@ -480,6 +480,16 @@ public final class BPlusTreePage {
     }
 
     /**
+     * Checks whether replacing the separator key at {@code index} with {@code newKey} fits in this internal page.
+     */
+    public boolean canReplaceInternalKeyAt(int index, Value newKey) {
+        int currentOffset = getSlotOffset(index);
+        int currentLen = entryPayloadLengthAtOffset(currentOffset);
+        int newLen = internalEntryPayloadBytes(newKey);
+        return getTotalFreeSpace() + currentLen >= newLen;
+    }
+
+    /**
      * Replaces the separator key and RecordId at {@code index} in an internal node while preserving
      * its {@code rightChildPageId}.
      */
@@ -487,6 +497,13 @@ public final class BPlusTreePage {
         int rightChild = getRightChildPageId(index);
         removeAt(index);
         insertInternalAt(index, newKey, newRecordId, rightChild);
+    }
+
+    /**
+     * Copies the entire B+Tree node state (header, slot directory, and payload area) from {@code source}.
+     */
+    public void copyNodeContentsFrom(BPlusTreePage source) {
+        System.arraycopy(source.raw, NODE_TYPE_OFFSET, this.raw, NODE_TYPE_OFFSET, getPageSize() - NODE_TYPE_OFFSET);
     }
 
     public List<IndexEntry> getAllLeafEntries() {
