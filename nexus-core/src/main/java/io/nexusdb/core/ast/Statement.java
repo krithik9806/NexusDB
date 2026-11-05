@@ -10,6 +10,8 @@ public sealed interface Statement
         permits Statement.CreateDatabaseStatement,
                 Statement.CreateTableStatement,
                 Statement.DropTableStatement,
+                Statement.CreateIndexStatement,
+                Statement.DropIndexStatement,
                 Statement.InsertStatement,
                 Statement.SelectStatement,
                 Statement.UpdateStatement,
@@ -49,6 +51,43 @@ public sealed interface Statement
         public DropTableStatement {
             Objects.requireNonNull(tableName, "tableName must not be null");
             if (tableName.isBlank()) {
+                throw new IllegalArgumentException("tableName must not be blank");
+            }
+        }
+    }
+
+    /**
+     * {@code CREATE [UNIQUE] INDEX <indexName> ON <tableName> (<columnName>)}
+     */
+    record CreateIndexStatement(
+            String indexName,
+            String tableName,
+            String columnName,
+            boolean unique) implements Statement {
+        public CreateIndexStatement {
+            Objects.requireNonNull(indexName, "indexName must not be null");
+            Objects.requireNonNull(tableName, "tableName must not be null");
+            Objects.requireNonNull(columnName, "columnName must not be null");
+            if (indexName.isBlank() || tableName.isBlank() || columnName.isBlank()) {
+                throw new IllegalArgumentException("Index, table, and column names must not be blank");
+            }
+        }
+    }
+
+    /**
+     * {@code DROP INDEX <indexName> [ON <tableName>]}
+     */
+    record DropIndexStatement(String indexName, String tableName) implements Statement {
+        public DropIndexStatement(String indexName) {
+            this(indexName, null);
+        }
+
+        public DropIndexStatement {
+            Objects.requireNonNull(indexName, "indexName must not be null");
+            if (indexName.isBlank()) {
+                throw new IllegalArgumentException("indexName must not be blank");
+            }
+            if (tableName != null && tableName.isBlank()) {
                 throw new IllegalArgumentException("tableName must not be blank");
             }
         }

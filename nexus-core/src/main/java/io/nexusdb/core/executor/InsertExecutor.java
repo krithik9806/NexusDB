@@ -1,6 +1,10 @@
 package io.nexusdb.core.executor;
 
+import io.nexusdb.core.catalog.IndexMetadata;
 import io.nexusdb.core.catalog.TableMetadata;
+import io.nexusdb.core.index.BPlusTree;
+import io.nexusdb.core.index.DuplicateKeyException;
+import io.nexusdb.core.page.RecordId;
 import io.nexusdb.core.planner.BindException;
 import io.nexusdb.core.planner.BoundExpr;
 import io.nexusdb.core.record.Column;
@@ -11,13 +15,16 @@ import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.record.Value;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Physical {@code INSERT} operator that evaluates bound row expressions, validates runtime
- * constraints, inserts tuples into the target {@link TableHeap}, and emits a single tuple
- * containing the number of inserted rows.
+ * and unique-index constraints, inserts tuples into the target {@link TableHeap}, maintains
+ * all registered {@link BPlusTree} indexes, and emits a single tuple containing the number
+ * of inserted rows.
  */
 public final class InsertExecutor implements Executor {
     public static final Schema DML_OUTPUT_SCHEMA = new Schema(List.of(
@@ -47,7 +54,8 @@ public final class InsertExecutor implements Executor {
 
         Schema schema = table.getSchema();
         TableHeap heap = table.getTableHeap();
-        int count = 0;
+        List<IndexMetadata> indexes = table.getIndexes();
+        List<Tuple> tuplesToInsert = new ArrayList<>(rows.size());
 
         for (List<BoundExpr> rowExprs : rows) {
             List<Value> values = new ArrayList<>(schema.getColumnCount());
@@ -57,7 +65,36 @@ public final class InsertExecutor implements Executor {
                 val = validateAndCoerceColumnValue(val, col);
                 values.add(val);
             }
-            heap.insert(new Tuple(values));
+            tuplesToInsert.add(new Tuple(values));
+        }
+
+        // Pre-validate all unique indexes (both intra-batch and against existing index entries)
+        // before mutating the heap so failed INSERTs leave heap and indexes completely unchanged.
+        for (IndexMetadata idx : indexes) {
+            if (!idx.unique()) {
+                continue;
+            }
+            int colIdx = schema.getColumnIndex(idx.columnName());
+            BPlusTree tree = table.getIndexTree(idx);
+            Set<Value> batchSeen = new HashSet<>();
+            for (Tuple candidate : tuplesToInsert) {
+                Value keyVal = candidate.getValue(colIdx);
+                if (!batchSeen.add(keyVal) || !tree.search(keyVal).isEmpty()) {
+                    throw new DuplicateKeyException(
+                            "Duplicate key '" + keyVal + "' violates unique index '"
+                                    + idx.indexName() + "' on column '" + idx.columnName() + "'");
+                }
+            }
+        }
+
+        int count = 0;
+        for (Tuple tuple : tuplesToInsert) {
+            RecordId rid = heap.insert(tuple);
+            for (IndexMetadata idx : indexes) {
+                int colIdx = schema.getColumnIndex(idx.columnName());
+                BPlusTree tree = table.getIndexTree(idx);
+                tree.insert(tuple.getValue(colIdx), rid);
+            }
             count++;
         }
 

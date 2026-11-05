@@ -31,6 +31,17 @@ public final class AstPrinter {
                             + ")";
             case Statement.DropTableStatement(String tableName) ->
                     "DROP TABLE " + tableName;
+            case Statement.CreateIndexStatement(
+                    String indexName,
+                    String tableName,
+                    String columnName,
+                    boolean unique) ->
+                    (unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ")
+                            + indexName + " ON " + tableName + " (" + columnName + ")";
+            case Statement.DropIndexStatement(String indexName, String tableName) ->
+                    tableName == null
+                            ? "DROP INDEX " + indexName
+                            : "DROP INDEX " + indexName + " ON " + tableName;
             case Statement.InsertStatement(String tableName, List<String> cols, List<List<Expr>> rows) -> {
                 StringBuilder sb = new StringBuilder("INSERT INTO ").append(tableName);
                 if (!cols.isEmpty()) {

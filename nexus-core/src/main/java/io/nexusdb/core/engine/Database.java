@@ -125,6 +125,12 @@ public final class Database implements AutoCloseable {
             }
             case BoundStatement.BoundCreateTable(String tableName, var schema) -> {
                 catalog.createTable(tableName, schema);
+                for (Column col : schema.getColumns()) {
+                    if (col.primaryKey()) {
+                        String pkIndexName = "pk_" + tableName + "_" + col.name();
+                        catalog.createIndex(tableName, pkIndexName, col.name(), true);
+                    }
+                }
                 long elapsed = System.nanoTime() - startNanos;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, "CREATE TABLE " + tableName);
             }
@@ -132,6 +138,21 @@ public final class Database implements AutoCloseable {
                 catalog.dropTable(tableName);
                 long elapsed = System.nanoTime() - startNanos;
                 yield new ResultSet(List.of(), List.of(), 0, elapsed, "DROP TABLE " + tableName);
+            }
+            case BoundStatement.BoundCreateIndex(
+                    String indexName,
+                    String tableName,
+                    String columnName,
+                    boolean unique) -> {
+                catalog.createIndex(tableName, indexName, columnName, unique);
+                long elapsed = System.nanoTime() - startNanos;
+                String tag = (unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ") + indexName;
+                yield new ResultSet(List.of(), List.of(), 0, elapsed, tag);
+            }
+            case BoundStatement.BoundDropIndex(String indexName, String tableName) -> {
+                catalog.dropIndex(tableName, indexName);
+                long elapsed = System.nanoTime() - startNanos;
+                yield new ResultSet(List.of(), List.of(), 0, elapsed, "DROP INDEX " + indexName);
             }
             case BoundStatement.BoundSelect select -> {
                 try (Executor executor = executionPlanner.plan(select)) {

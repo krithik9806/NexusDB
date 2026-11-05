@@ -13,6 +13,8 @@ public sealed interface BoundStatement
         permits BoundStatement.BoundCreateDatabase,
                 BoundStatement.BoundCreateTable,
                 BoundStatement.BoundDropTable,
+                BoundStatement.BoundCreateIndex,
+                BoundStatement.BoundDropIndex,
                 BoundStatement.BoundInsert,
                 BoundStatement.BoundSelect,
                 BoundStatement.BoundUpdate,
@@ -34,6 +36,25 @@ public sealed interface BoundStatement
 
     record BoundDropTable(String tableName) implements BoundStatement {
         public BoundDropTable {
+            Objects.requireNonNull(tableName, "tableName must not be null");
+        }
+    }
+
+    record BoundCreateIndex(
+            String indexName,
+            String tableName,
+            String columnName,
+            boolean unique) implements BoundStatement {
+        public BoundCreateIndex {
+            Objects.requireNonNull(indexName, "indexName must not be null");
+            Objects.requireNonNull(tableName, "tableName must not be null");
+            Objects.requireNonNull(columnName, "columnName must not be null");
+        }
+    }
+
+    record BoundDropIndex(String indexName, String tableName) implements BoundStatement {
+        public BoundDropIndex {
+            Objects.requireNonNull(indexName, "indexName must not be null");
             Objects.requireNonNull(tableName, "tableName must not be null");
         }
     }

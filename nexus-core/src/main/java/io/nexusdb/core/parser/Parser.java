@@ -151,7 +151,26 @@ public final class Parser {
         if (match(TokenType.TABLE)) {
             return parseCreateTable();
         }
-        throw error(peek(), "Expected 'DATABASE' or 'TABLE' after 'CREATE', found '" + peek().lexeme() + "'");
+        boolean unique = match(TokenType.UNIQUE);
+        if (match(TokenType.INDEX)) {
+            return parseCreateIndex(unique);
+        }
+        if (unique) {
+            throw error(peek(), "Expected 'INDEX' after 'CREATE UNIQUE', found '" + peek().lexeme() + "'");
+        }
+        throw error(peek(), "Expected 'DATABASE', 'TABLE', 'INDEX', or 'UNIQUE INDEX' after 'CREATE', found '"
+                + peek().lexeme() + "'");
+    }
+
+    private Statement.CreateIndexStatement parseCreateIndex(boolean unique) {
+        Token indexName = consumeIdentifier("Expected index name after 'INDEX'");
+        consume(TokenType.ON, "Expected 'ON' after index name '" + indexName.lexeme() + "'");
+        Token tableName = consumeIdentifier("Expected table name after 'ON'");
+        consume(TokenType.LPAREN, "Expected '(' after table name '" + tableName.lexeme() + "'");
+        Token columnName = consumeIdentifier("Expected column name in CREATE INDEX");
+        consume(TokenType.RPAREN, "Expected ')' after column name '" + columnName.lexeme() + "'");
+        return new Statement.CreateIndexStatement(
+                indexName.lexeme(), tableName.lexeme(), columnName.lexeme(), unique);
     }
 
     private Statement.CreateTableStatement parseCreateTable() {
@@ -228,7 +247,16 @@ public final class Parser {
             Token tableName = consumeIdentifier("Expected table name after 'DROP TABLE'");
             return new Statement.DropTableStatement(tableName.lexeme());
         }
-        throw error(peek(), "Expected 'TABLE' after 'DROP', found '" + peek().lexeme() + "'");
+        if (match(TokenType.INDEX)) {
+            Token indexName = consumeIdentifier("Expected index name after 'DROP INDEX'");
+            String tableName = null;
+            if (match(TokenType.ON)) {
+                Token tableTok = consumeIdentifier("Expected table name after 'ON'");
+                tableName = tableTok.lexeme();
+            }
+            return new Statement.DropIndexStatement(indexName.lexeme(), tableName);
+        }
+        throw error(peek(), "Expected 'TABLE' or 'INDEX' after 'DROP', found '" + peek().lexeme() + "'");
     }
 
     private Statement.InsertStatement parseInsert() {

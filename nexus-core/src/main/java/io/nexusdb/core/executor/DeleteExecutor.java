@@ -1,6 +1,8 @@
 package io.nexusdb.core.executor;
 
+import io.nexusdb.core.catalog.IndexMetadata;
 import io.nexusdb.core.catalog.TableMetadata;
+import io.nexusdb.core.index.BPlusTree;
 import io.nexusdb.core.page.RecordId;
 import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
@@ -12,8 +14,9 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Physical {@code DELETE} operator that removes matching tuples from a {@link TableHeap}
- * and emits a single tuple containing the number of deleted rows.
+ * Physical {@code DELETE} operator that removes matching tuples from a {@link TableHeap},
+ * deletes their corresponding entries from all table {@link BPlusTree} indexes, and emits
+ * a single tuple containing the number of deleted rows.
  */
 public final class DeleteExecutor implements Executor {
     private final TableMetadata table;
@@ -38,23 +41,32 @@ public final class DeleteExecutor implements Executor {
         }
         executed = true;
 
-        List<RecordId> targetRids = new ArrayList<>();
+        List<Tuple> targetTuples = new ArrayList<>();
         try {
             Tuple t;
             while ((t = child.next()) != null) {
                 if (t.getRecordId() == null) {
                     throw new IllegalStateException("Cannot delete tuple without RecordId");
                 }
-                targetRids.add(t.getRecordId());
+                targetTuples.add(t);
             }
         } finally {
             child.close();
         }
 
+        Schema schema = table.getSchema();
         TableHeap heap = table.getTableHeap();
+        List<IndexMetadata> indexes = table.getIndexes();
         int deletedCount = 0;
-        for (RecordId rid : targetRids) {
+
+        for (Tuple tuple : targetTuples) {
+            RecordId rid = tuple.getRecordId();
             if (heap.delete(rid)) {
+                for (IndexMetadata idx : indexes) {
+                    int colIdx = schema.getColumnIndex(idx.columnName());
+                    BPlusTree tree = table.getIndexTree(idx);
+                    tree.delete(tuple.getValue(colIdx), rid);
+                }
                 deletedCount++;
             }
         }

@@ -19,7 +19,7 @@ create_table_stmt  ::= "CREATE" "TABLE" identifier "(" column_def { "," column_d
 column_def         ::= identifier data_type [ "PRIMARY" "KEY" ] [ "NOT" "NULL" ] ;
 drop_table_stmt    ::= "DROP" "TABLE" identifier ;
 create_index_stmt  ::= "CREATE" [ "UNIQUE" ] "INDEX" identifier "ON" identifier "(" identifier ")" ;
-drop_index_stmt    ::= "DROP" "INDEX" identifier ;
+drop_index_stmt    ::= "DROP" "INDEX" identifier [ "ON" identifier ] ;
 
 dml_stmt           ::= insert_stmt | select_stmt | update_stmt | delete_stmt ;
 

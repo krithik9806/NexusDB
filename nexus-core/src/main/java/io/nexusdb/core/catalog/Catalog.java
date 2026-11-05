@@ -1,6 +1,7 @@
 package io.nexusdb.core.catalog;
 
 import io.nexusdb.core.buffer.BufferPoolManager;
+import io.nexusdb.core.index.BPlusTree;
 import io.nexusdb.core.page.Page;
 import io.nexusdb.core.page.RecordId;
 import io.nexusdb.core.page.SlottedPage;
@@ -8,6 +9,8 @@ import io.nexusdb.core.record.Column;
 import io.nexusdb.core.record.DataType;
 import io.nexusdb.core.record.Schema;
 import io.nexusdb.core.record.TableHeap;
+import io.nexusdb.core.record.TableIterator;
+import io.nexusdb.core.record.Tuple;
 import io.nexusdb.core.storage.DiskManager;
 
 import java.io.ByteArrayInputStream;
@@ -30,8 +33,8 @@ import java.util.regex.Pattern;
  *
  * <p>Concurrency & Crash-Safety Invariants:
  * <ul>
- *   <li>All DDL operations ({@link #createTable}, {@link #dropTable}, {@link #registerIndex},
- *       {@link #dropIndex}) are serialized on {@code catalogLock}.</li>
+ *   <li>All DDL operations ({@link #createTable}, {@link #dropTable}, {@link #createIndex},
+ *       {@link #registerIndex}, {@link #dropIndex}) are serialized on {@code catalogLock}.</li>
  *   <li>When initializing a brand-new database file, the root catalog page is formatted and unpinned
  *       before its page ID is recorded in Page 0 via {@link DiskManager#setCatalogMetaPageId(int)}.</li>
  *   <li>Each catalog page is pinned only for the duration of an individual read/write step and
@@ -99,7 +102,7 @@ public final class Catalog {
 
             while (currPageId != -1) {
                 tailPageId = currPageId;
-                List< RawCatalogSlot > rawSlots = new ArrayList<>();
+                List<RawCatalogSlot> rawSlots = new ArrayList<>();
                 int nextPageId;
 
                 Page page = bufferPoolManager.fetchPage(currPageId);
@@ -163,7 +166,8 @@ public final class Catalog {
     }
 
     /**
-     * Drops the named table from the catalog and deallocates all pages belonging to its {@link TableHeap}.
+     * Drops the named table from the catalog and deallocates all pages belonging to its {@link TableHeap}
+     * and any associated {@link BPlusTree} indexes.
      *
      * @return {@code true} if the table existed and was dropped, {@code false} if no such table exists
      */
@@ -176,6 +180,9 @@ public final class Catalog {
                 return false;
             }
             deleteCatalogRecordLocked(meta.getCatalogRecordId());
+            for (IndexMetadata idx : meta.getIndexes()) {
+                freeIndexPagesIfValidLocked(meta, idx);
+            }
             freeHeapPagesLocked(meta.getFirstPageId());
             return true;
         }
@@ -209,6 +216,70 @@ public final class Catalog {
     }
 
     /**
+     * Looks up an {@link IndexMetadata} by index name across all tables (case-insensitive).
+     */
+    public IndexMetadata findIndex(String indexName) {
+        Objects.requireNonNull(indexName, "indexName must not be null");
+        synchronized (catalogLock) {
+            for (TableMetadata table : tables.values()) {
+                IndexMetadata idx = table.getIndex(indexName);
+                if (idx != null) {
+                    return idx;
+                }
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Allocates a new {@link BPlusTree} index on {@code tableName(columnName)}, populates it from
+     * all existing rows in the table's {@link TableHeap}, and persists the index in the catalog.
+     */
+    public IndexMetadata createIndex(
+            String tableName,
+            String indexName,
+            String columnName,
+            boolean unique) {
+        validateIdentifier(indexName, "index name");
+        validateIdentifier(tableName, "table name");
+        validateIdentifier(columnName, "column name");
+
+        synchronized (catalogLock) {
+            TableMetadata meta = getTable(tableName);
+            if (meta == null) {
+                throw new IllegalArgumentException("Unknown table: " + tableName);
+            }
+            if (!meta.getSchema().hasColumn(columnName)) {
+                throw new IllegalArgumentException(
+                        "Column '" + columnName + "' does not exist in table '" + meta.getName() + "'");
+            }
+            if (findIndex(indexName) != null) {
+                throw new IllegalArgumentException("Index already exists: " + indexName);
+            }
+
+            int colIdx = meta.getSchema().getColumnIndex(columnName);
+            Column canonicalCol = meta.getSchema().getColumn(colIdx);
+            BPlusTree tree = BPlusTree.create(bufferPoolManager, canonicalCol.type(), unique);
+
+            try (TableIterator it = meta.getTableHeap().scan()) {
+                while (it.hasNext()) {
+                    Tuple row = it.next();
+                    tree.insert(row.getValue(colIdx), row.getRecordId());
+                }
+            } catch (RuntimeException e) {
+                tree.freeAllPages();
+                throw e;
+            }
+
+            IndexMetadata registered = registerIndex(
+                    meta.getName(), indexName, canonicalCol.name(), tree.getRootPageId(), unique);
+            TableMetadata updated = getTable(meta.getName());
+            updated.putIndexTree(indexName, tree);
+            return registered;
+        }
+    }
+
+    /**
      * Registers a new index on an existing table and persists the updated catalog entry.
      */
     public IndexMetadata registerIndex(
@@ -226,10 +297,8 @@ public final class Catalog {
                 throw new IllegalArgumentException(
                         "Column '" + columnName + "' does not exist in table '" + meta.getName() + "'");
             }
-            for (IndexMetadata existing : meta.getIndexes()) {
-                if (existing.indexName().equalsIgnoreCase(indexName)) {
-                    throw new IllegalArgumentException("Index already exists: " + indexName);
-                }
+            if (findIndex(indexName) != null) {
+                throw new IllegalArgumentException("Index already exists: " + indexName);
             }
 
             Column canonicalCol = meta.getSchema().getColumn(columnName);
@@ -244,6 +313,17 @@ public final class Catalog {
         }
     }
 
+    public boolean dropIndex(String indexName) {
+        Objects.requireNonNull(indexName, "indexName must not be null");
+        synchronized (catalogLock) {
+            IndexMetadata found = findIndex(indexName);
+            if (found == null) {
+                return false;
+            }
+            return dropIndex(found.tableName(), found.indexName());
+        }
+    }
+
     public boolean dropIndex(String tableName, String indexName) {
         Objects.requireNonNull(tableName, "tableName must not be null");
         Objects.requireNonNull(indexName, "indexName must not be null");
@@ -252,14 +332,27 @@ public final class Catalog {
             if (meta == null) {
                 return false;
             }
-            List<IndexMetadata> updatedIndexes = new ArrayList<>(meta.getIndexes());
-            boolean removed = updatedIndexes.removeIf(idx -> idx.indexName().equalsIgnoreCase(indexName));
-            if (!removed) {
+            IndexMetadata targetIdx = meta.getIndex(indexName);
+            if (targetIdx == null) {
                 return false;
             }
+            List<IndexMetadata> updatedIndexes = new ArrayList<>(meta.getIndexes());
+            updatedIndexes.removeIf(idx -> idx.indexName().equalsIgnoreCase(indexName));
             TableMetadata updatedMeta = updateCatalogMetadataLocked(meta, updatedIndexes);
+            updatedMeta.removeIndexTree(indexName);
             tables.put(normalize(meta.getName()), updatedMeta);
+            freeIndexPagesIfValidLocked(meta, targetIdx);
             return true;
+        }
+    }
+
+    private void freeIndexPagesIfValidLocked(TableMetadata meta, IndexMetadata idx) {
+        int rootPid = idx.rootPageId();
+        int totalPages = bufferPoolManager.getDiskManager().getPageCount();
+        if (rootPid > 0 && rootPid < totalPages && !bufferPoolManager.getPageAllocator().isFree(rootPid)) {
+            Column col = meta.getSchema().getColumn(idx.columnName());
+            BPlusTree tree = BPlusTree.open(bufferPoolManager, rootPid, col.type(), idx.unique());
+            tree.freeAllPages();
         }
     }
 

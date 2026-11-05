@@ -9,6 +9,7 @@ import io.nexusdb.core.ast.SelectItem;
 import io.nexusdb.core.ast.Statement;
 import io.nexusdb.core.ast.TableRef;
 import io.nexusdb.core.catalog.Catalog;
+import io.nexusdb.core.catalog.IndexMetadata;
 import io.nexusdb.core.catalog.TableMetadata;
 import io.nexusdb.core.record.Column;
 import io.nexusdb.core.record.DataType;
@@ -49,6 +50,8 @@ public final class Binder {
             case Statement.CreateDatabaseStatement createDb -> bindCreateDatabase(createDb);
             case Statement.CreateTableStatement createTable -> bindCreateTable(createTable);
             case Statement.DropTableStatement dropTable -> bindDropTable(dropTable);
+            case Statement.CreateIndexStatement createIndex -> bindCreateIndex(createIndex);
+            case Statement.DropIndexStatement dropIndex -> bindDropIndex(dropIndex);
             case Statement.InsertStatement insert -> bindInsert(insert);
             case Statement.SelectStatement select -> bindSelect(select);
             case Statement.UpdateStatement update -> bindUpdate(update);
@@ -95,6 +98,43 @@ public final class Binder {
     private BoundStatement.BoundDropTable bindDropTable(Statement.DropTableStatement stmt) {
         TableMetadata meta = requireTable(stmt.tableName());
         return new BoundStatement.BoundDropTable(meta.getName());
+    }
+
+    private BoundStatement.BoundCreateIndex bindCreateIndex(Statement.CreateIndexStatement stmt) {
+        validateIdentifierOrThrow(stmt.indexName(), "index name");
+        validateIdentifierOrThrow(stmt.tableName(), "table name");
+        validateIdentifierOrThrow(stmt.columnName(), "column name");
+
+        TableMetadata table = requireTable(stmt.tableName());
+        if (!table.getSchema().hasColumn(stmt.columnName())) {
+            throw new BindException(
+                    "Unknown column '" + stmt.columnName() + "' in table '" + table.getName() + "'");
+        }
+        if (catalog.findIndex(stmt.indexName()) != null) {
+            throw new BindException("Index already exists: " + stmt.indexName());
+        }
+        Column canonicalCol = table.getSchema().getColumn(stmt.columnName());
+        return new BoundStatement.BoundCreateIndex(
+                stmt.indexName(), table.getName(), canonicalCol.name(), stmt.unique());
+    }
+
+    private BoundStatement.BoundDropIndex bindDropIndex(Statement.DropIndexStatement stmt) {
+        validateIdentifierOrThrow(stmt.indexName(), "index name");
+        if (stmt.tableName() != null) {
+            validateIdentifierOrThrow(stmt.tableName(), "table name");
+            TableMetadata table = requireTable(stmt.tableName());
+            IndexMetadata idx = table.getIndex(stmt.indexName());
+            if (idx == null) {
+                throw new BindException(
+                        "Unknown index '" + stmt.indexName() + "' on table '" + table.getName() + "'");
+            }
+            return new BoundStatement.BoundDropIndex(idx.indexName(), table.getName());
+        }
+        IndexMetadata found = catalog.findIndex(stmt.indexName());
+        if (found == null) {
+            throw new BindException("Unknown index: " + stmt.indexName());
+        }
+        return new BoundStatement.BoundDropIndex(found.indexName(), found.tableName());
     }
 
     private BoundStatement.BoundInsert bindInsert(Statement.InsertStatement stmt) {
